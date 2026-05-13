@@ -222,15 +222,9 @@ in summary:
 - File channel → QUIC bidirectional stream, one per transfer.
 - Audio channel → QUIC unidirectional stream + optional datagrams.
 
-## Open questions
+## Resolved questions
 
-- Should we mandate QUIC datagrams for the Audio channel in v0, or
-  only "MAY"? Current lean: SHOULD; clients without datagram support
-  fall back to the stream.
-- Should we require QUIC implementations to support 0-RTT for
-  resumption? Current lean: SHOULD; security caveats around 0-RTT
-  replay must be handled at the auth layer.
-- HTTP/3 ALPN tunneling: do we provide an explicit HTTP/3 framing
-  for environments that strictly require HTTP semantics on UDP/443?
-  Current lean: no in v0; revisit if real-world deployments hit
-  firewalls that allow HTTP/3 but not raw QUIC.
+All open questions are resolved — see [`decisions.md`](decisions.md):
+- D10: QUIC datagrams for Audio → SHOULD.
+- D11: 0-RTT for SessionResume only → SHOULD, with single-use tokens.
+- D21: HTTP/3 ALPN tunneling → no in v0.

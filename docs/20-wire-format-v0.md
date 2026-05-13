@@ -14,6 +14,11 @@ implementations MUST match it.
   unless explicitly noted (TLS-defined fields inside the QUIC
   handshake remain network byte order; OpenRD's own bytes are
   little-endian).
+- **CBOR profile:** Control-channel messages use CBOR
+  **Preferred Serialization** (RFC 8949 §4.1) by default. Signed
+  structures (resumption tokens, invitation tokens) MUST use
+  **Deterministic Encoding** (RFC 8949 §4.2) so the receiver can
+  re-hash the bytes for signature verification.
 - **Notation:** Fields are described as `name : type` followed by
   a description. Types are:
   - `u8`, `u16`, `u32`, `u64` — unsigned little-endian integers
@@ -332,14 +337,15 @@ release the decoded frame to the renderer.
 
 ## Input channel frames (kind 0x0004)
 
-| Type | Name           | Description           |
-|------|----------------|------------------------|
-| 0x01 | KeyEvent       | Keyboard event         |
-| 0x02 | PointerMove    | Mouse / pointer move   |
-| 0x03 | PointerButton  | Mouse / pointer button |
-| 0x04 | PointerWheel   | Scroll wheel           |
-| 0x05 | TouchEvent     | Touchscreen event      |
-| 0x06 | SyntheticBatch | Atomic batch (paste)   |
+| Type | Name           | Description                        |
+|------|----------------|-------------------------------------|
+| 0x01 | KeyEvent       | Keyboard event                      |
+| 0x02 | PointerMove    | Mouse / pointer move                |
+| 0x03 | PointerButton  | Mouse / pointer button              |
+| 0x04 | PointerWheel   | Scroll wheel                        |
+| 0x05 | TouchEvent     | Touchscreen event                   |
+| 0x06 | SyntheticBatch | Atomic batch (paste)                |
+| 0x07 | TextInput      | Committed Unicode text (mobile/IME) |
 
 ### KeyEvent (type 0x01)
 
@@ -432,6 +438,25 @@ Phases: 0 = begin, 1 = move, 2 = end, 3 = cancel.
 The batch is applied atomically server-side: either all inner events
 succeed, or none. Used for "paste as typing" fallback when the
 clipboard is unavailable.
+
+### TextInput (type 0x07)
+
+```
++----------------+
+| text : bytes<u32>  ; UTF-8, length-prefixed, max 64 KiB per message
++----------------+
+```
+
+The server treats `text` as committed text input and injects it as if
+the user had typed it. Used by mobile virtual keyboards, emoji
+pickers, voice-to-text, and the committed output of client-side IMEs.
+
+The server MUST NOT distinguish between TextInput and an equivalent
+sequence of KeyEvent / SyntheticBatch frames at the level of the
+target application: both look like "the user typed these characters."
+
+Modifier keys are NOT carried in TextInput. If the client needs to
+send modified keystrokes (e.g., Ctrl-C), it MUST use KeyEvent.
 
 ---
 
@@ -635,11 +660,51 @@ Status: `0` = OK, `1` = HASH_MISMATCH, `2` = OUT_OF_SPACE,
 | Default port (QUIC/UDP)        | 443           |
 | Default port (TLS/TCP fallback)| 443           |
 
-## Open items
+## Resolved items
 
-- Settle the keysym table for keyboards with no X11 keysym (mobile,
-  IME). Probably reference XKB.
-- Decide on a canonical CBOR profile (deterministic vs. preferred-
-  serialization).
-- Confirm the ALPN identifier `"openrd/v0"` doesn't collide; will
-  request an IANA code point at v1.
+All wire-format open questions for v0 are resolved — see
+[`decisions.md`](decisions.md):
+- D6: TextInput message handles mobile/IME/emoji.
+- D7: Hybrid CBOR profile (Preferred + Deterministic for signed).
+- D20: IANA ALPN registration deferred to v1; v0 uses
+  `"openrd/v0"` without IANA-registered status.
+
+## Chat channel frames (kind 0x0009)
+
+| Type | Name             | Description                          |
+|------|------------------|---------------------------------------|
+| 0x01 | ChatMessage      | UTF-8 text message                   |
+| 0x02 | TypingIndicator  | start / stop                         |
+| 0x03 | ChatAttachment   | Inline attachment up to 1 MiB        |
+
+### ChatMessage (type 0x01)
+
+```
+CBOR map:
+  1 (msg_id)     : uint    ; sender-allocated, unique within session
+  2 (sender)     : tstr    ; authenticated identity from AuthResult.identity
+  3 (body)       : tstr    ; UTF-8, up to 16 KiB
+  4 (ts_ms)      : uint    ; sender's wall-clock ms since epoch
+```
+
+### TypingIndicator (type 0x02)
+
+```
+CBOR map:
+  1 (sender)     : tstr
+  2 (state)      : tstr    ; "start" | "stop"
+```
+
+### ChatAttachment (type 0x03)
+
+```
+CBOR map:
+  1 (msg_id)     : uint
+  2 (sender)     : tstr
+  3 (mime)       : tstr    ; e.g. "image/png"
+  4 (filename)   : tstr    ; optional, display only
+  5 (bytes)      : bstr    ; up to 1 MiB
+```
+
+Attachments above 1 MiB MUST be transferred via the File channel and
+referenced by file path or transfer ID in a regular ChatMessage.

@@ -62,6 +62,7 @@ Capabilities are a CBOR map keyed by short integers. v0 keys:
 | 13   | resumption_window_seconds  | uint                | `30`                     |
 | 14   | transport_features         | array of tstr       | `["quic-datagrams"]` if supported, else `[]` |
 | 15   | extensions                 | map of tstr → any   | `{}`                      |
+| 16   | chat                       | map                  | `{enabled: true, max_attachment: 1048576}` |
 
 ### Detailed semantics
 
@@ -300,13 +301,11 @@ server → client: ServerHello {
 
 ---
 
-## Open items
+## Resolved items
 
-- Should the profile name be replaced with a version+optional-extension
-  bitmask? Current lean: keep the string for human readability.
-- A registry for `transport_features` strings: who maintains it?
-  v0 ships with two; the rest are TBD.
-- Whether the negotiation should be re-runnable mid-session (for
-  example, after permission elevation). Current lean: no — the
-  NegotiatedProfile is fixed at session start. Permission level
-  is tracked separately and CAN change at runtime via consent.
+All open questions are resolved — see [`decisions.md`](decisions.md):
+- D14: Profile is a string name.
+- D15: NegotiatedProfile is fixed at session start (no
+  mid-session renegotiation).
+- D19: `transport_features` is spec-author-maintained; v0 ships
+  two values.

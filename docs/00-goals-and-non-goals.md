@@ -117,9 +117,9 @@ When proposing a feature or change, cite the goal it advances. When
 rejecting a feature, cite the non-goal it conflicts with. If neither
 applies, the document is incomplete — update it.
 
-## Open questions
+## Resolved questions
 
-- Should multi-monitor be a v0 goal or a v1 feature? Currently leaning v1.
-- Should the protocol include a built-in chat channel for support
-  scenarios, or is that a client-side concern? Currently leaning client-side.
-- Smart-card and USB redirection: v1 or v2? Currently leaning v2.
+All open questions are resolved — see [`decisions.md`](decisions.md):
+- D1: Multi-monitor → v1.
+- D4: Chat channel → v0 core (kind 0x0009).
+- D3: Smart-card and USB redirection → v2.

@@ -323,12 +323,10 @@ Channel handlers run in their own tasks; the main loop schedules I/O.
 
 ---
 
-## Open items
+## Resolved items
 
-- Should resumption be allowed across QUIC migrations within the same
-  connection, or only via fresh connections? Currently: QUIC migration
-  is transport-level and never requires SessionResume. SessionResume
-  is for crossing the QUIC connection boundary entirely.
-- Should the consent flow include a "remember for this session"
-  option in the wire format, or is that a client-side UX detail?
-  Lean: client-side UX.
+All open questions are resolved — see [`decisions.md`](decisions.md):
+- D12: Strict separation — QUIC migration is transport-only;
+  SessionResume is only for fresh QUIC connections.
+- D13: Consent "remember for session" is client-side UX, not
+  wire-level.

@@ -1,0 +1,25 @@
+[package]
+name = "openrd-server"
+description = "OpenRD reference server (Linux)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "openrd-server"
+path = "src/main.rs"
+
+[dependencies]
+openrd-proto = { path = "../openrd-proto" }
+anyhow = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ciborium = { workspace = true }
+bytes = { workspace = true }

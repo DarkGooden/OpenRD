@@ -43,10 +43,11 @@ allocations.
 | 0x0006     | File             | bidirectional      | many (one per transfer) |
 | 0x0007     | Audio (playback) | server → client    | one                |
 | 0x0008     | Stats            | bidirectional      | one (optional)     |
+| 0x0009     | Chat             | bidirectional      | one (optional)     |
 | 0x0100–0x01FF | Reserved      | —                  | for v1+ standard channels |
 | 0x8000–0xFFFF | Vendor        | —                  | for vendor-private extensions |
 
-Kinds 0x0009–0x00FF are reserved for future v0 amendments. Vendor
+Kinds 0x000A–0x00FF are reserved for future v0 amendments. Vendor
 extensions in the 0x8000–0xFFFF range must not conflict with the
 standard space and must be ignorable by peers that do not understand
 them.
@@ -209,6 +210,29 @@ Client-microphone audio (server-bound) is **not in v0**.
 
 ---
 
+## The Chat channel (0x0009)
+
+The Chat channel carries real-time text chat between the two human
+operators of a session — typically a support technician and an
+end user (UC-2). Optional; only open it if both peers advertise
+support.
+
+Message types:
+
+- `ChatMessage { id, sender, body, ts_ms }` — UTF-8 text message
+- `TypingIndicator { sender, state }` — `state ∈ {start, stop}`
+- `ChatAttachment { id, sender, mime, bytes }` — inline attachment
+  up to 1 MiB. Larger attachments MUST use the File channel.
+
+v0 deliberately omits: read receipts, edit/delete, threading,
+reactions. These are v1+ considerations.
+
+**Reliability:** ordered, reliable.
+**Direction:** bidirectional.
+**Cardinality:** zero or one.
+
+---
+
 ## The Stats channel (0x0008)
 
 Optional. Carries periodic telemetry from each side to the other:
@@ -246,20 +270,16 @@ explicit `OpenChannel` and is subject to authorization:
 | File       | Yes             | Yes             | interactive          |
 | Audio      | Yes             | No              | view-only or higher  |
 | Stats      | Yes             | Yes             | view-only or higher  |
+| Chat       | Yes             | Yes             | view-only or higher  |
 
 A server MUST refuse an OpenChannel for which the requesting side
 lacks permission, with a structured error (T-13 mitigation).
 
 ---
 
-## Open questions
+## Resolved questions
 
-- Multi-monitor: do we open multiple Display channels (one per
-  monitor) in v1, or a single multi-region channel? Current lean: one
-  channel per monitor, simpler to reason about.
-- Should the Stats channel carry server-side process metrics
-  (CPU, memory) or only protocol metrics? Current lean: protocol only;
-  process telemetry belongs in the operator's monitoring stack.
-- Vendor extension allocation: spec a "request kind" registry, or
-  leave 0x8000–0xFFFF entirely free? Lean: free in v0; we can add a
-  registry later if needed.
+All open questions for v0 are resolved — see [`decisions.md`](decisions.md):
+- D8: Multi-monitor uses N Display channels (v1 intent).
+- D9: Stats channel is protocol metrics only.
+- D18: Vendor extension space is unmanaged in v0.

@@ -265,14 +265,9 @@ themselves.
 
 ---
 
-## Open questions
+## Resolved questions
 
-- Should the protocol mandate Perfect Forward Secrecy beyond what TLS
-  1.3 already provides? (TLS 1.3 mandates ephemeral key exchange, so
-  probably no additional requirement is needed.)
-- Should we standardize a session-recording format for audit purposes,
-  or leave that to implementations? Probably leave to implementations.
-- Quantum resistance: do we mandate a hybrid KEM (e.g., X25519 +
-  ML-KEM) for v0, defer to v1, or rely on TLS 1.3's evolving cipher
-  list? Leaning defer to v1 unless a TLS 1.3 hybrid suite is widely
-  available by then.
+All open questions are resolved — see [`decisions.md`](decisions.md):
+- D16: No additional PFS beyond TLS 1.3.
+- D5: Session recording → informative appendix only.
+- D17: Hybrid post-quantum KEM → defer to v1, track TLS 1.3 hybrid rollout.
