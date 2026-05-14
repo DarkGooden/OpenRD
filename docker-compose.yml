@@ -1,0 +1,32 @@
+# OpenRD docker-compose for repeatable dev tasks.
+#
+# Usage:
+#   docker compose run --rm dev cargo build --workspace
+#   docker compose run --rm dev cargo test --workspace
+#   docker compose run --rm dev bash scripts/smoke-test.sh
+#   docker compose run --rm --service-ports dev cargo run -p openrd-server
+
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    image: openrd-dev
+    working_dir: /work
+    volumes:
+      - .:/work
+      - cargo-cache:/usr/local/cargo
+      - target-cache:/work/target
+    environment:
+      RUST_LOG: openrd_server=info,openrd_proto=info
+      CARGO_TERM_COLOR: always
+    ports:
+      - "4443:4443/udp"   # QUIC
+      - "4443:4443/tcp"   # TLS-over-TCP fallback (when wired)
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  cargo-cache:
+  target-cache:

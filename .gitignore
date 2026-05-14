@@ -16,6 +16,10 @@ Thumbs.db
 *.pem
 *.key
 *.crt
+
+# Local build logs / one-off helpers
+build.log
+build-test.cmd
 !docs/**/*.pem
 !docs/**/*.key
 .env

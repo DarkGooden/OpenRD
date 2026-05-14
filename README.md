@@ -46,27 +46,47 @@ is being scaffolded.
 
 ### Building
 
-The server requires Rust 1.75+ and a Linux build environment for
-capture / injection (those paths aren't wired yet, so the workspace
-builds on any platform Rust supports).
+The server is Linux-only (PipeWire / X11 / uinput targets), so the
+canonical dev environment is a Docker container. The repo ships a
+`Dockerfile` and `docker-compose.yml`; you don't need a Rust toolchain
+on the host.
 
 ```sh
-cargo build --workspace
-cargo test  --workspace
+docker compose run --rm dev cargo build --workspace
+docker compose run --rm dev cargo test  --workspace
 ```
 
-### Running the hello exchange (native, end-to-end)
+A persistent volume caches the cargo registry and the `target/`
+directory between runs, so subsequent builds are fast.
+
+If you prefer a host Rust toolchain (Rust 1.75+), `cargo build` works
+on macOS and Linux without further setup. Windows works too once the
+MSVC toolchain is properly installed; the Docker path avoids that
+hurdle.
+
+### Smoke test (end-to-end hello exchange)
+
+```sh
+docker compose run --rm dev bash scripts/smoke-test.sh
+```
+
+Builds, starts the server, runs the native test client, prints the
+parsed ServerHello, and tears down. Expected last line:
+`=== SMOKE TEST PASSED ===`.
+
+### Running the hello exchange manually
 
 In one terminal, start the server:
 
 ```sh
-RUST_LOG=openrd_server=info cargo run -p openrd-server
+docker compose run --rm --service-ports dev \
+  cargo run -p openrd-server
 ```
 
-In another terminal, run the test client:
+In another terminal, run the test client against the same container:
 
 ```sh
-cargo run -p openrd-test-client
+docker compose exec dev cargo run -p openrd-test-client
 ```
 
 Expected output on the client:
