@@ -12,4 +12,5 @@ rust-version.workspace = true
 ciborium = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 bytes = { workspace = true }
