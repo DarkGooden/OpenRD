@@ -1,19 +1,22 @@
-//! OpenRD reference server (Linux).
+//! OpenRD reference server (Linux primary; runs on any host for dev).
 //!
 //! v0 status: scaffolding. The server stands up a QUIC endpoint with
-//! ALPN `openrd/v0`, accepts connections, and logs them. The Control
-//! channel handler, channel dispatch, capture, encode, and input
-//! injection are TODO and tracked in the docs.
+//! ALPN `openrd/v0`, accepts connections, accepts the Control
+//! bidirectional stream from the client, runs the hello exchange,
+//! and then closes. The full Control loop, capture, encode, and
+//! input injection are TODO.
 //!
 //! Run with:
 //! ```text
 //! RUST_LOG=openrd_server=info cargo run -p openrd-server
 //! ```
 
+mod control;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use quinn::{Endpoint, ServerConfig};
 use tracing::{info, warn};
 
@@ -56,21 +59,22 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_connection(conn: quinn::Connection) -> Result<()> {
-    info!(remote = %conn.remote_address(), "new connection");
+    let remote = conn.remote_address();
+    info!(%remote, "new connection");
 
-    // TODO: accept the Control bidirectional stream (QUIC stream id 0)
-    // from the client. Run the hello exchange (ClientHello /
-    // ServerHello). Authenticate. Loop on Control messages: dispatch
-    // OpenChannel requests, route channel data, etc.
-    //
-    // The state machine is in docs/21-state-machines.md.
-    // The Control message schemas are in
-    //   crates/openrd-proto/src/control.rs
-    //   docs/20-wire-format-v0.md
-    // The capability schema is in docs/22-capability-negotiation.md.
+    // Accept the Control bidirectional stream from the client.
+    let (send, recv) = conn
+        .accept_bi()
+        .await
+        .context("accept Control bidi stream")?;
+    info!(%remote, "accepted Control bidi stream");
+
+    if let Err(e) = control::handle_control_stream(send, recv, remote).await {
+        warn!(%remote, "Control hello exchange failed: {e:#}");
+    }
 
     conn.closed().await;
-    info!(remote = %conn.remote_address(), "connection closed");
+    info!(%remote, "connection closed");
     Ok(())
 }
 

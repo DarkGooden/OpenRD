@@ -23,3 +23,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ciborium = { workspace = true }
 bytes = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"
