@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/openrd-proto",
     "crates/openrd-server",
+    "crates/openrd-test-client",
 ]
 
 [workspace.package]

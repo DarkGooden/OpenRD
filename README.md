@@ -55,17 +55,43 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-To run the placeholder server:
+### Running the hello exchange (native, end-to-end)
+
+In one terminal, start the server:
 
 ```sh
 RUST_LOG=openrd_server=info cargo run -p openrd-server
 ```
 
-To serve the web client placeholder:
+In another terminal, run the test client:
 
 ```sh
-python3 -m http.server -d web 8080
+cargo run -p openrd-test-client
 ```
+
+Expected output on the client:
+
+```
+connecting to 127.0.0.1:4443 (SNI localhost)...
+connected; opening Control bidirectional stream
+sent ClientHello (frame N B, payload N B)
+recv frame: ver=0 type=0x02 len=N
+ServerHello fields:
+  protocol_version: 0
+  server_name:      "openrd-server/0.0.1"
+  capabilities:     0 entries
+  session_id:       <32 hex chars>
+  server_time:      <unix epoch>
+```
+
+### Web client placeholder
+
+The web client (`web/`) needs the server to speak WebTransport-over-
+HTTP/3, which it doesn't yet. It currently fails at the WebTransport
+handshake. A follow-up will add WebTransport via the `wtransport`
+crate so the browser can connect.
+
+For now, develop and test against the native test client.
 
 ### Repository layout
 
@@ -74,7 +100,8 @@ OpenRD/
 ├── Cargo.toml                 ← workspace
 ├── crates/
 │   ├── openrd-proto/          ← wire-format types, framing, channel defs
-│   └── openrd-server/         ← reference server (Linux)
+│   ├── openrd-server/         ← reference server (Linux)
+│   └── openrd-test-client/    ← native test client (dev only)
 ├── web/                       ← placeholder web client (static)
 ├── docs/                      ← the specification
 │   ├── 00-goals-and-non-goals.md

@@ -1,0 +1,24 @@
+[package]
+name = "openrd-test-client"
+description = "Native test client for the OpenRD reference server (dev only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "openrd-test-client"
+path = "src/main.rs"
+
+[dependencies]
+openrd-proto = { path = "../openrd-proto" }
+anyhow = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+ciborium = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = "0.4"
