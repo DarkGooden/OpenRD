@@ -15,6 +15,7 @@ pub mod frame;
 pub mod channel;
 pub mod error;
 pub mod control;
+pub mod capabilities;
 pub mod input;
 pub mod display;
 pub mod cursor;
@@ -26,6 +27,7 @@ pub mod chat;
 pub use frame::{Frame, FrameHeader, ProtocolVersion, MAX_FRAME_LENGTH};
 pub use channel::{ChannelKind, ChannelId};
 pub use error::{ErrorCode, ParseError};
+pub use capabilities::{Capabilities, NegotiatedProfile, NegotiationError};
 
 /// The protocol version this crate implements.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V0;

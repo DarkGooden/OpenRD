@@ -19,7 +19,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
-use openrd_proto::{Frame, FrameHeader, ALPN, MAX_FRAME_LENGTH, PROTOCOL_VERSION};
+use openrd_proto::{
+    Capabilities, Frame, FrameHeader, NegotiatedProfile, ALPN, MAX_FRAME_LENGTH,
+    PROTOCOL_VERSION,
+};
 use quinn::{ClientConfig, Endpoint};
 
 const SERVER: &str = "127.0.0.1:4443";
@@ -47,8 +50,10 @@ async fn main() -> Result<()> {
 
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
 
+    let client_caps = Capabilities::default();
+
     // ClientHello.
-    let payload = encode_client_hello();
+    let payload = encode_client_hello(&client_caps);
     let mut frame = Vec::with_capacity(FrameHeader::SIZE + payload.len());
     Frame::encode(
         ControlFrameType::ClientHello as u8,
@@ -84,14 +89,31 @@ async fn main() -> Result<()> {
 
     let value: Cbor = ciborium::de::from_reader(parsed.payload)
         .context("decode ServerHello CBOR")?;
-    describe_server_hello(&value);
+    let server_caps = describe_server_hello(&value);
+
+    // Compute the negotiated profile and print it.
+    match NegotiatedProfile::negotiate(&client_caps, &server_caps) {
+        Ok(profile) => {
+            println!("Negotiated profile:");
+            println!("  version:           {}", profile.version);
+            println!("  display_codec:     {}", profile.display_codec);
+            println!("  display_resolution: {}x{}", profile.display_resolution.0, profile.display_resolution.1);
+            println!("  display_max_fps:   {}", profile.display_max_fps);
+            println!("  audio_codec:       {}", profile.audio_codec.as_deref().unwrap_or("(none)"));
+            println!("  auth_methods:      {:?}", profile.auth_methods);
+            println!("  chat_enabled:      {}", profile.chat_enabled);
+        }
+        Err(e) => {
+            anyhow::bail!("capability negotiation failed: {e}");
+        }
+    }
 
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-fn encode_client_hello() -> Vec<u8> {
+fn encode_client_hello(caps: &Capabilities) -> Vec<u8> {
     let value = Cbor::Map(vec![
         (
             Cbor::Integer(1u32.into()),
@@ -101,6 +123,7 @@ fn encode_client_hello() -> Vec<u8> {
             Cbor::Integer(2u32.into()),
             Cbor::Text("openrd-test-client/0.0.1".to_owned()),
         ),
+        (Cbor::Integer(3u32.into()), caps.to_cbor()),
     ]);
     let mut out = Vec::new();
     ciborium::ser::into_writer(&value, &mut out).expect("encode ClientHello");
@@ -120,13 +143,14 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     Ok(full)
 }
 
-fn describe_server_hello(v: &Cbor) {
+fn describe_server_hello(v: &Cbor) -> Capabilities {
     println!("ServerHello fields:");
+    let mut server_caps = Capabilities::default();
     let map = match v.as_map() {
         Some(m) => m,
         None => {
             println!("  (not a map)");
-            return;
+            return server_caps;
         }
     };
     for (k, val) in map {
@@ -144,8 +168,17 @@ fn describe_server_hello(v: &Cbor) {
                 println!("  server_name:      \"{s}\"");
             }
             3 => {
-                let n = val.as_map().map(|m| m.len()).unwrap_or(0);
-                println!("  capabilities:     {n} entries");
+                server_caps = Capabilities::from_cbor(val);
+                println!("  capabilities:");
+                println!("    profile:        {}", server_caps.profile);
+                println!("    auth_methods:   {:?}", server_caps.auth_methods);
+                println!("    display_codecs: {:?}", server_caps.display_codecs);
+                println!("    audio_codecs:   {:?}", server_caps.audio_codecs);
+                println!(
+                    "    max_resolution: {}x{}",
+                    server_caps.display_max_resolution.0,
+                    server_caps.display_max_resolution.1
+                );
             }
             4 => {
                 let h = val
@@ -158,11 +191,10 @@ fn describe_server_hello(v: &Cbor) {
                 let n = val.as_integer().and_then(|i| u64::try_from(i).ok()).unwrap_or(0);
                 println!("  server_time:      {n}");
             }
-            _ => {
-                println!("  (unknown key {key})");
-            }
+            _ => {}
         }
     }
+    server_caps
 }
 
 fn make_client_config() -> Result<ClientConfig> {
