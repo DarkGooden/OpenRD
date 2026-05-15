@@ -19,10 +19,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ciborium::Value as Cbor;
+use openrd_proto::chat::ChatFrameType;
 use openrd_proto::clipboard::ClipboardFrameType;
 use openrd_proto::control::ControlFrameType;
 use openrd_proto::cursor::CursorFrameType;
 use openrd_proto::display::DisplayFrameType;
+use openrd_proto::file::FileFrameType;
 use openrd_proto::input::{InputFrameType, KeyEvent, TextInput};
 use openrd_proto::{
     Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
@@ -140,6 +142,24 @@ pub async fn handle_control_stream(
                     }
                 }));
             }
+            x if x == ChannelKind::CHAT.0 as u64 => {
+                let (send_s, recv_s) = conn.accept_bi().await?;
+                info!(%remote, "accepted Chat bidi stream");
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = handle_chat_stream(send_s, recv_s, remote).await {
+                        warn!(%remote, "Chat handler error: {e:#}");
+                    }
+                }));
+            }
+            x if x == ChannelKind::FILE.0 as u64 => {
+                let (send_s, recv_s) = conn.accept_bi().await?;
+                info!(%remote, "accepted File bidi stream");
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = handle_file_stream(send_s, recv_s, remote).await {
+                        warn!(%remote, "File handler error: {e:#}");
+                    }
+                }));
+            }
             _ => unreachable!("filtered above"),
         }
     }
@@ -156,6 +176,8 @@ fn is_supported_client_channel(kind: u64) -> bool {
         kind,
         x if x == ChannelKind::INPUT.0 as u64
             || x == ChannelKind::CLIPBOARD.0 as u64
+            || x == ChannelKind::CHAT.0 as u64
+            || x == ChannelKind::FILE.0 as u64
     )
 }
 
@@ -379,6 +401,310 @@ async fn handle_clipboard_stream(
     info!(%remote, "Clipboard stream closed");
     let _ = send.finish().await;
     Ok(())
+}
+
+// ===== Chat channel (bidirectional) ===================================
+
+async fn handle_chat_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    remote: SocketAddr,
+) -> Result<()> {
+    loop {
+        let frame_bytes = match read_full_frame_opt(&mut recv).await? {
+            Some(b) => b,
+            None => break,
+        };
+        let (frame, _) = Frame::parse(&frame_bytes)?;
+        let kind = ChatFrameType::from_u8(frame.header.frame_type)?;
+        match kind {
+            ChatFrameType::ChatMessage => {
+                let v: Cbor =
+                    ciborium::de::from_reader(frame.payload).context("decode ChatMessage")?;
+                let (msg_id, sender, body, ts_ms) = parse_chat_message(&v);
+                info!(%remote, msg_id, %sender, %body, ts_ms, "Chat::ChatMessage");
+
+                // Echo back with a server prefix so the client can see
+                // the round trip worked.
+                let echo_body = format!("[server-echo] {body}");
+                let echo = build_chat_message(
+                    msg_id + 1_000_000,
+                    "openrd-server/0.0.1",
+                    &echo_body,
+                    ts_ms + 1,
+                );
+                let mut payload = Vec::new();
+                ciborium::ser::into_writer(&echo, &mut payload)?;
+                write_frame(&mut send, ChatFrameType::ChatMessage as u8, &payload).await?;
+                info!(%remote, body = %echo_body, "Chat::ChatMessage (echoed)");
+            }
+            ChatFrameType::TypingIndicator => {
+                let v: Cbor =
+                    ciborium::de::from_reader(frame.payload).context("decode TypingIndicator")?;
+                let (sender, state) = parse_typing_indicator(&v);
+                info!(%remote, %sender, %state, "Chat::TypingIndicator");
+            }
+            ChatFrameType::ChatAttachment => {
+                let v: Cbor =
+                    ciborium::de::from_reader(frame.payload).context("decode ChatAttachment")?;
+                let (msg_id, sender, mime, len) = parse_chat_attachment_meta(&v);
+                info!(
+                    %remote,
+                    msg_id, %sender, %mime, len,
+                    "Chat::ChatAttachment (metadata only logged)"
+                );
+            }
+        }
+    }
+    info!(%remote, "Chat stream closed");
+    let _ = send.finish().await;
+    Ok(())
+}
+
+fn parse_chat_message(v: &Cbor) -> (u64, String, String, u64) {
+    let mut msg_id: u64 = 0;
+    let mut sender = String::new();
+    let mut body = String::new();
+    let mut ts_ms: u64 = 0;
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        msg_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        sender = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(s) = val.as_text() {
+                        body = s.to_owned();
+                    }
+                }
+                4 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        ts_ms = n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (msg_id, sender, body, ts_ms)
+}
+
+fn build_chat_message(msg_id: u64, sender: &str, body: &str, ts_ms: u64) -> Cbor {
+    Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer(msg_id.into())),
+        (Cbor::Integer(2u32.into()), Cbor::Text(sender.to_owned())),
+        (Cbor::Integer(3u32.into()), Cbor::Text(body.to_owned())),
+        (Cbor::Integer(4u32.into()), Cbor::Integer(ts_ms.into())),
+    ])
+}
+
+fn parse_typing_indicator(v: &Cbor) -> (String, String) {
+    let mut sender = String::new();
+    let mut state = String::new();
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(s) = val.as_text() {
+                        sender = s.to_owned();
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        state = s.to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (sender, state)
+}
+
+fn parse_chat_attachment_meta(v: &Cbor) -> (u64, String, String, usize) {
+    let mut msg_id: u64 = 0;
+    let mut sender = String::new();
+    let mut mime = String::new();
+    let mut len: usize = 0;
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        msg_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        sender = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(s) = val.as_text() {
+                        mime = s.to_owned();
+                    }
+                }
+                5 => {
+                    if let Some(b) = val.as_bytes() {
+                        len = b.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (msg_id, sender, mime, len)
+}
+
+// ===== File channel (bidirectional) ===================================
+
+async fn handle_file_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    remote: SocketAddr,
+) -> Result<()> {
+    let mut transfer_id_seen: u32 = 0;
+    let mut chunks_acked: u32 = 0;
+
+    loop {
+        let frame_bytes = match read_full_frame_opt(&mut recv).await? {
+            Some(b) => b,
+            None => break,
+        };
+        let (frame, _) = Frame::parse(&frame_bytes)?;
+        let kind = FileFrameType::from_u8(frame.header.frame_type)?;
+        match kind {
+            FileFrameType::StartTransfer | FileFrameType::Manifest => {
+                let v: Cbor = ciborium::de::from_reader(frame.payload)
+                    .context("decode StartTransfer/Manifest")?;
+                let (tid, direction, root, entries, chunk_size) = parse_file_manifest(&v);
+                transfer_id_seen = tid as u32;
+                info!(
+                    %remote,
+                    transfer_id = tid,
+                    %direction,
+                    %root,
+                    entries,
+                    chunk_size,
+                    frame_type = format!("{kind:?}"),
+                    "File::Manifest"
+                );
+            }
+            FileFrameType::Chunk => {
+                // Binary chunk: transfer_id u32, file_index u32,
+                // chunk_index u32, bytes <u32>.
+                if frame.payload.len() < 16 {
+                    bail!("Chunk payload too short ({} bytes)", frame.payload.len());
+                }
+                let tid = u32::from_le_bytes([
+                    frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
+                ]);
+                let file_idx = u32::from_le_bytes([
+                    frame.payload[4], frame.payload[5], frame.payload[6], frame.payload[7],
+                ]);
+                let chunk_idx = u32::from_le_bytes([
+                    frame.payload[8], frame.payload[9], frame.payload[10], frame.payload[11],
+                ]);
+                let bytes_len = u32::from_le_bytes([
+                    frame.payload[12], frame.payload[13], frame.payload[14], frame.payload[15],
+                ]) as usize;
+                let bytes = &frame.payload[16..16 + bytes_len.min(frame.payload.len() - 16)];
+                let preview = String::from_utf8_lossy(bytes);
+                info!(
+                    %remote,
+                    tid, file_idx, chunk_idx,
+                    bytes = bytes.len(),
+                    %preview,
+                    "File::Chunk"
+                );
+
+                let mut ack = Vec::with_capacity(13);
+                ack.extend(&tid.to_le_bytes());
+                ack.extend(&file_idx.to_le_bytes());
+                ack.extend(&chunk_idx.to_le_bytes());
+                ack.push(0x00); // status OK
+                write_frame(&mut send, FileFrameType::AckChunk as u8, &ack).await?;
+                chunks_acked += 1;
+                info!(%remote, tid, chunk_idx, "File::AckChunk OK");
+            }
+            FileFrameType::EndTransfer => {
+                info!(
+                    %remote,
+                    transfer_id = transfer_id_seen,
+                    chunks_acked,
+                    "File::EndTransfer"
+                );
+            }
+            other => info!(%remote, ?other, "File::(unhandled)"),
+        }
+    }
+    info!(%remote, "File stream closed");
+    let _ = send.finish().await;
+    Ok(())
+}
+
+fn parse_file_manifest(v: &Cbor) -> (u64, String, String, usize, u64) {
+    let mut transfer_id: u64 = 0;
+    let mut direction = String::new();
+    let mut root = String::new();
+    let mut entries: usize = 0;
+    let mut chunk_size: u64 = 0;
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        transfer_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        direction = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(s) = val.as_text() {
+                        root = s.to_owned();
+                    }
+                }
+                4 => {
+                    if let Some(a) = val.as_array() {
+                        entries = a.len();
+                    }
+                }
+                5 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        chunk_size = n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (transfer_id, direction, root, entries, chunk_size)
 }
 
 // ===== Display test pattern (server-initiated) ========================

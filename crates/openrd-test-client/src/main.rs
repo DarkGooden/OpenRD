@@ -8,10 +8,12 @@
 
 use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
+use openrd_proto::chat::ChatFrameType;
 use openrd_proto::clipboard::ClipboardFrameType;
 use openrd_proto::control::ControlFrameType;
 use openrd_proto::cursor::CursorFrameType;
 use openrd_proto::display::DisplayFrameType;
+use openrd_proto::file::FileFrameType;
 use openrd_proto::input::{InputFrameType, KeyEvent, Modifiers, TextInput};
 use openrd_proto::{
     Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
@@ -129,9 +131,11 @@ async fn main() -> Result<()> {
     let display_handle = tokio::spawn(receive_display(display_stream));
     let cursor_handle = tokio::spawn(receive_cursor(cursor_stream));
 
-    // === Client-initiated channels: Input then Clipboard ===
+    // === Client-initiated channels in sequence ===
     open_channel_and_exercise_input(&conn, &mut send, &mut recv).await?;
     open_channel_and_exercise_clipboard(&conn, &mut send, &mut recv).await?;
+    open_channel_and_exercise_chat(&conn, &mut send, &mut recv).await?;
+    open_channel_and_exercise_file(&conn, &mut send, &mut recv).await?;
 
     // Close Control so the server's dispatcher loop ends.
     send.finish().await.ok();
@@ -320,6 +324,206 @@ fn parse_clipboard_content(v: &Cbor) -> (u64, String, Vec<u8>) {
         }
     }
     (request_id, mime, bytes)
+}
+
+// ===== Chat channel ===================================================
+
+async fn open_channel_and_exercise_chat(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    let oc = encode_open_channel(ChannelKind::CHAT.0 as u64, 3, 10);
+    write_frame(send, ControlFrameType::OpenChannel as u8, &oc).await?;
+    println!("\nsent OpenChannel(Chat, channel_id=3)");
+
+    expect_ack(recv, "Chat").await?;
+
+    let (mut chat_send, mut chat_recv) = conn.open_bi().await?.await?;
+    println!("opened Chat bidi stream");
+
+    // TypingIndicator: start
+    let typing = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Text("openrd-test-client".to_owned())),
+        (Cbor::Integer(2u32.into()), Cbor::Text("start".to_owned())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&typing, &mut buf)?;
+    write_frame(&mut chat_send, ChatFrameType::TypingIndicator as u8, &buf).await?;
+    println!("sent Chat::TypingIndicator (start)");
+
+    // ChatMessage
+    let body = "olá from the test client! how are things server-side?";
+    let msg = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer(7u32.into())),
+        (Cbor::Integer(2u32.into()), Cbor::Text("openrd-test-client".to_owned())),
+        (Cbor::Integer(3u32.into()), Cbor::Text(body.to_owned())),
+        (Cbor::Integer(4u32.into()), Cbor::Integer(0u32.into())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&msg, &mut buf)?;
+    write_frame(&mut chat_send, ChatFrameType::ChatMessage as u8, &buf).await?;
+    println!("sent Chat::ChatMessage (\"{body}\")");
+
+    // Read server's echo.
+    let bytes = read_frame(&mut chat_recv).await?;
+    let (frame, _) = Frame::parse(&bytes)?;
+    if frame.header.frame_type != ChatFrameType::ChatMessage as u8 {
+        bail!(
+            "expected Chat::ChatMessage echo (0x01), got 0x{:02x}",
+            frame.header.frame_type
+        );
+    }
+    let v: Cbor = ciborium::de::from_reader(frame.payload)?;
+    let (msg_id, sender, echo_body) = parse_chat_message_client(&v);
+    println!("recv Chat::ChatMessage echo msg_id={msg_id} sender={sender} body=\"{echo_body}\"");
+
+    // TypingIndicator: stop
+    let typing = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Text("openrd-test-client".to_owned())),
+        (Cbor::Integer(2u32.into()), Cbor::Text("stop".to_owned())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&typing, &mut buf)?;
+    write_frame(&mut chat_send, ChatFrameType::TypingIndicator as u8, &buf).await?;
+    println!("sent Chat::TypingIndicator (stop)");
+
+    chat_send.finish().await.ok();
+    println!("finished Chat bidi stream");
+    Ok(())
+}
+
+fn parse_chat_message_client(v: &Cbor) -> (u64, String, String) {
+    let mut msg_id: u64 = 0;
+    let mut sender = String::new();
+    let mut body = String::new();
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        msg_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        sender = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(s) = val.as_text() {
+                        body = s.to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (msg_id, sender, body)
+}
+
+// ===== File channel ===================================================
+
+async fn open_channel_and_exercise_file(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    let oc = encode_open_channel(ChannelKind::FILE.0 as u64, 4, 14);
+    write_frame(send, ControlFrameType::OpenChannel as u8, &oc).await?;
+    println!("\nsent OpenChannel(File, channel_id=4)");
+
+    expect_ack(recv, "File").await?;
+
+    let (mut file_send, mut file_recv) = conn.open_bi().await?.await?;
+    println!("opened File bidi stream");
+
+    let payload_bytes = b"Hello, world from the test client's file transfer!";
+    let transfer_id: u32 = 1;
+    let file_idx: u32 = 0;
+    let chunk_idx: u32 = 0;
+
+    // Manifest as a single combined frame (StartTransfer/Manifest are
+    // collapsed for the scaffold). Chunk SHA-256 is a placeholder
+    // (32 zero bytes) — the wire format carries it; v0 server logs
+    // but doesn't verify.
+    let dummy_hash = vec![0u8; 32];
+    let manifest = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer((transfer_id as u64).into())),
+        (Cbor::Integer(2u32.into()), Cbor::Text("upload".to_owned())),
+        (Cbor::Integer(3u32.into()), Cbor::Text("/tmp/uploaded".to_owned())),
+        (
+            Cbor::Integer(4u32.into()),
+            Cbor::Array(vec![Cbor::Map(vec![
+                (Cbor::Integer(1u32.into()), Cbor::Text("hello.txt".to_owned())),
+                (
+                    Cbor::Integer(2u32.into()),
+                    Cbor::Integer((payload_bytes.len() as u64).into()),
+                ),
+                (Cbor::Integer(3u32.into()), Cbor::Integer(0o644u32.into())),
+                (Cbor::Integer(4u32.into()), Cbor::Integer(0u32.into())),
+                (
+                    Cbor::Integer(5u32.into()),
+                    Cbor::Array(vec![Cbor::Bytes(dummy_hash.clone())]),
+                ),
+            ])]),
+        ),
+        (Cbor::Integer(5u32.into()), Cbor::Integer(262144u32.into())),
+        (Cbor::Integer(6u32.into()), Cbor::Bytes(dummy_hash.clone())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&manifest, &mut buf)?;
+    write_frame(&mut file_send, FileFrameType::StartTransfer as u8, &buf).await?;
+    println!("sent File::StartTransfer (manifest, 1 file, {} bytes)", payload_bytes.len());
+
+    // One Chunk (binary layout): transfer_id u32, file_idx u32,
+    // chunk_idx u32, bytes <u32>.
+    let mut chunk = Vec::with_capacity(16 + payload_bytes.len());
+    chunk.extend(&transfer_id.to_le_bytes());
+    chunk.extend(&file_idx.to_le_bytes());
+    chunk.extend(&chunk_idx.to_le_bytes());
+    chunk.extend(&(payload_bytes.len() as u32).to_le_bytes());
+    chunk.extend(payload_bytes);
+    write_frame(&mut file_send, FileFrameType::Chunk as u8, &chunk).await?;
+    println!("sent File::Chunk ({} bytes)", payload_bytes.len());
+
+    // Read AckChunk.
+    let bytes = read_frame(&mut file_recv).await?;
+    let (frame, _) = Frame::parse(&bytes)?;
+    if frame.header.frame_type != FileFrameType::AckChunk as u8 {
+        bail!(
+            "expected File::AckChunk (0x04), got 0x{:02x}",
+            frame.header.frame_type
+        );
+    }
+    if frame.payload.len() < 13 {
+        bail!("AckChunk payload too short");
+    }
+    let ack_tid = u32::from_le_bytes([
+        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
+    ]);
+    let ack_status = frame.payload[12];
+    println!(
+        "recv File::AckChunk transfer_id={ack_tid} chunk_idx={chunk_idx} status={ack_status}"
+    );
+
+    // EndTransfer (CBOR with transfer_id + status).
+    let end = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer((transfer_id as u64).into())),
+        (Cbor::Integer(2u32.into()), Cbor::Integer(0u32.into())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&end, &mut buf)?;
+    write_frame(&mut file_send, FileFrameType::EndTransfer as u8, &buf).await?;
+    println!("sent File::EndTransfer (status=0)");
+
+    file_send.finish().await.ok();
+    println!("finished File bidi stream");
+    Ok(())
 }
 
 // ===== Display receiver ===============================================
