@@ -1,22 +1,23 @@
 //! Native test client for the OpenRD reference server.
 //!
-//! Connects via WebTransport, opens the Control bidi stream, runs the
-//! v0 scaffolding flow: ClientHello / ServerHello / AuthRequest /
-//! AuthResult / OpenChannel(Input) / OpenChannelAck / a few input
-//! events on a unidirectional stream / clean close.
-//!
-//! Skips server-certificate validation; dev only.
+//! Walks through the v0 scaffolding flow: hello + auth, then exercises
+//! every supported channel — server-initiated (Display, Cursor) and
+//! client-initiated (Input, Clipboard). Each channel is exercised with
+//! a small canned sequence; on the server side the smoke test verifies
+//! the corresponding events appear in the log.
 
 use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
+use openrd_proto::clipboard::ClipboardFrameType;
 use openrd_proto::control::ControlFrameType;
+use openrd_proto::cursor::CursorFrameType;
 use openrd_proto::display::DisplayFrameType;
 use openrd_proto::input::{InputFrameType, KeyEvent, Modifiers, TextInput};
 use openrd_proto::{
     Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
     MAX_FRAME_LENGTH, PROTOCOL_VERSION,
 };
-use wtransport::{ClientConfig, Endpoint};
+use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
 
 const SERVER_URL: &str = "https://127.0.0.1:4443/openrd";
 
@@ -34,34 +35,17 @@ async fn main() -> Result<()> {
     let conn = endpoint.connect(SERVER_URL).await.context("WT connect")?;
     println!("connected; opening Control bidirectional stream");
 
-    let mut bi = conn.open_bi().await.context("open_bi")?.await?;
-    let send = &mut bi.0;
-    let recv = &mut bi.1;
+    let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?.await?;
 
     let client_caps = Capabilities::default();
 
-    // --- ClientHello ------------------------------------------------------
+    // === ClientHello / ServerHello ===
     let payload = encode_client_hello(&client_caps);
-    let mut frame = Vec::with_capacity(FrameHeader::SIZE + payload.len());
-    Frame::encode(
-        ControlFrameType::ClientHello as u8,
-        &payload,
-        &mut frame,
-    );
-    send.write_all(&frame).await?;
-    println!(
-        "sent ClientHello (frame {} B, payload {} B)",
-        frame.len(),
-        payload.len()
-    );
+    write_frame(&mut send, ControlFrameType::ClientHello as u8, &payload).await?;
+    println!("sent ClientHello ({} payload bytes)", payload.len());
 
-    // --- ServerHello ------------------------------------------------------
-    let bytes = read_frame(recv).await?;
+    let bytes = read_frame(&mut recv).await?;
     let (parsed, _) = Frame::parse(&bytes)?;
-    println!(
-        "recv frame: ver={} type=0x{:02x} len={}",
-        parsed.header.version.0, parsed.header.frame_type, parsed.header.length
-    );
     if parsed.header.frame_type != ControlFrameType::ServerHello as u8 {
         bail!(
             "expected ServerHello (0x02), got 0x{:02x}",
@@ -72,110 +56,109 @@ async fn main() -> Result<()> {
         .context("decode ServerHello CBOR")?;
     let server_caps = describe_server_hello(&value);
 
-    let profile = match NegotiatedProfile::negotiate(&client_caps, &server_caps) {
-        Ok(p) => {
-            println!("Negotiated profile:");
-            println!("  version:           {}", p.version);
-            println!("  display_codec:     {}", p.display_codec);
-            println!(
-                "  display_resolution: {}x{}",
-                p.display_resolution.0, p.display_resolution.1
-            );
-            println!("  display_max_fps:   {}", p.display_max_fps);
-            println!("  audio_codec:       {}", p.audio_codec.as_deref().unwrap_or("(none)"));
-            println!("  auth_methods:      {:?}", p.auth_methods);
-            println!("  chat_enabled:      {}", p.chat_enabled);
-            p
-        }
-        Err(e) => bail!("capability negotiation failed: {e}"),
-    };
+    let profile = NegotiatedProfile::negotiate(&client_caps, &server_caps)
+        .context("capability negotiation failed")?;
+    println!(
+        "Negotiated: codec={} {}x{}@{}fps auth={:?} chat={}",
+        profile.display_codec,
+        profile.display_resolution.0,
+        profile.display_resolution.1,
+        profile.display_max_fps,
+        profile.auth_methods,
+        profile.chat_enabled
+    );
 
-    // --- AuthRequest ------------------------------------------------------
+    // === AuthRequest / AuthResult ===
     let pin = std::env::var("OPENRD_PIN").unwrap_or_else(|_| {
-        eprintln!("warning: OPENRD_PIN not set; sending empty PIN (will fail auth)");
+        eprintln!("warning: OPENRD_PIN not set; sending empty PIN");
         String::new()
     });
-    if !profile.auth_methods.iter().any(|m| m == "pin") {
-        bail!(
-            "server doesn't support PIN auth (offers {:?})",
-            profile.auth_methods
-        );
-    }
     let auth_payload = encode_auth_request("pin", pin.as_bytes());
-    let mut frame_buf = Vec::with_capacity(FrameHeader::SIZE + auth_payload.len());
-    Frame::encode(
-        ControlFrameType::AuthRequest as u8,
-        &auth_payload,
-        &mut frame_buf,
-    );
-    send.write_all(&frame_buf).await?;
+    write_frame(&mut send, ControlFrameType::AuthRequest as u8, &auth_payload).await?;
     println!("\nsent AuthRequest (method=pin, credential={} B)", pin.len());
 
-    let bytes = read_frame(recv).await?;
+    let bytes = read_frame(&mut recv).await?;
     let (parsed, _) = Frame::parse(&bytes)?;
-    println!(
-        "recv frame: ver={} type=0x{:02x} len={}",
-        parsed.header.version.0, parsed.header.frame_type, parsed.header.length
-    );
     if parsed.header.frame_type != ControlFrameType::AuthResult as u8 {
         bail!(
             "expected AuthResult (0x05), got 0x{:02x}",
             parsed.header.frame_type
         );
     }
-    let auth_result: Cbor = ciborium::de::from_reader(parsed.payload)
-        .context("decode AuthResult")?;
+    let auth_result: Cbor = ciborium::de::from_reader(parsed.payload)?;
     let (status, permission, identity) = parse_auth_result(&auth_result);
-    println!("AuthResult:");
-    println!("  status:     {status} ({:?})", ErrorCode::from_u16(status as u16));
-    println!("  permission: {permission}");
-    println!("  identity:   {identity}");
-
+    println!(
+        "AuthResult: status={status} ({:?}) permission={permission} identity={identity}",
+        ErrorCode::from_u16(status as u16)
+    );
     if status != 0 {
         bail!("auth failed");
     }
 
-    // --- OpenChannel(Input) + send a few events ---------------------------
-    let oc_payload = encode_open_channel(ChannelKind::INPUT.0 as u64, 1, 2);
-    let mut oc_frame = Vec::with_capacity(FrameHeader::SIZE + oc_payload.len());
-    Frame::encode(
-        ControlFrameType::OpenChannel as u8,
-        &oc_payload,
-        &mut oc_frame,
-    );
-    send.write_all(&oc_frame).await?;
-    println!("\nsent OpenChannel(Input, channel_id=1)");
-
-    let ack_bytes = read_frame(recv).await?;
-    let (ack_frame, _) = Frame::parse(&ack_bytes)?;
-    if ack_frame.header.frame_type != ControlFrameType::OpenChannelAck as u8 {
-        bail!(
-            "expected OpenChannelAck (0x07), got 0x{:02x}",
-            ack_frame.header.frame_type
+    // === Read server's announcements for server-initiated channels ===
+    // The server sends OpenChannel(Display, ...) and OpenChannel(Cursor, ...)
+    // on the Control stream right after auth.
+    let mut server_uni_kinds: Vec<u64> = Vec::new();
+    for _ in 0..2 {
+        let bytes = read_frame(&mut recv).await?;
+        let (parsed, _) = Frame::parse(&bytes)?;
+        if parsed.header.frame_type != ControlFrameType::OpenChannel as u8 {
+            bail!(
+                "expected OpenChannel (0x06), got 0x{:02x}",
+                parsed.header.frame_type
+            );
+        }
+        let v: Cbor = ciborium::de::from_reader(parsed.payload)?;
+        let (kind, channel_id, _stream_id) = parse_open_channel(&v);
+        let name = match kind {
+            x if x == ChannelKind::DISPLAY.0 as u64 => "Display",
+            x if x == ChannelKind::CURSOR.0 as u64 => "Cursor",
+            _ => "(other)",
+        };
+        println!(
+            "server announced OpenChannel: kind=0x{kind:04x} ({name}) channel_id={channel_id}"
         );
-    }
-    let ack_val: Cbor =
-        ciborium::de::from_reader(ack_frame.payload).context("decode OpenChannelAck")?;
-    let (ack_channel_id, ack_status) = parse_open_channel_ack(&ack_val);
-    println!("recv OpenChannelAck: channel_id={ack_channel_id} status={ack_status}");
-    if ack_status != 0 {
-        bail!("server refused channel: status {ack_status}");
+        server_uni_kinds.push(kind);
     }
 
-    // Concurrently: send Input events (client → server) and receive
-    // the Display channel test pattern (server → client).
-    let input_fut = send_input_events(&conn);
-    let display_fut = receive_display_test_pattern(&conn);
-    let (i, d) = tokio::join!(input_fut, display_fut);
-    i.context("Input task")?;
-    d.context("Display task")?;
+    // === Accept the server-initiated uni streams in announcement order ===
+    let display_stream = conn.accept_uni().await?;
+    println!("accepted Display uni stream");
+    let cursor_stream = conn.accept_uni().await?;
+    println!("accepted Cursor uni stream");
+    let display_handle = tokio::spawn(receive_display(display_stream));
+    let cursor_handle = tokio::spawn(receive_cursor(cursor_stream));
+
+    // === Client-initiated channels: Input then Clipboard ===
+    open_channel_and_exercise_input(&conn, &mut send, &mut recv).await?;
+    open_channel_and_exercise_clipboard(&conn, &mut send, &mut recv).await?;
+
+    // Close Control so the server's dispatcher loop ends.
+    send.finish().await.ok();
+    println!("finished Control stream");
+
+    // Wait for the server-initiated receivers to drain.
+    display_handle.await??;
+    cursor_handle.await??;
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     conn.close(0u32.into(), b"bye");
     Ok(())
 }
 
-async fn send_input_events(conn: &wtransport::Connection) -> Result<()> {
+// ===== Input channel ===================================================
+
+async fn open_channel_and_exercise_input(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    let oc = encode_open_channel(ChannelKind::INPUT.0 as u64, 1, 2);
+    write_frame(send, ControlFrameType::OpenChannel as u8, &oc).await?;
+    println!("\nsent OpenChannel(Input, channel_id=1)");
+
+    expect_ack(recv, "Input").await?;
+
     let mut input_stream = conn.open_uni().await?.await?;
     println!("opened Input uni stream");
 
@@ -185,18 +168,21 @@ async fn send_input_events(conn: &wtransport::Connection) -> Result<()> {
         modifiers: Modifiers::default(),
         flags: 0x01,
     };
-    write_input_frame(&mut input_stream, InputFrameType::KeyEvent, &key_a_down).await?;
-    println!("sent KeyEvent (keysym=0x61 'a' down)");
+    write_input_keyevent(&mut input_stream, &key_a_down).await?;
+    println!("sent KeyEvent ('a' down)");
 
     let mut key_a_up = key_a_down;
     key_a_up.flags = 0x00;
-    write_input_frame(&mut input_stream, InputFrameType::KeyEvent, &key_a_up).await?;
-    println!("sent KeyEvent (keysym=0x61 'a' up)");
+    write_input_keyevent(&mut input_stream, &key_a_up).await?;
+    println!("sent KeyEvent ('a' up)");
 
-    let text = TextInput {
-        text: "olá, mundo 🌍".to_owned(),
-    };
-    write_input_frame(&mut input_stream, InputFrameType::TextInput, &text).await?;
+    write_input_textinput(
+        &mut input_stream,
+        &TextInput {
+            text: "olá, mundo 🌍".to_owned(),
+        },
+    )
+    .await?;
     println!("sent TextInput (\"olá, mundo 🌍\")");
 
     input_stream.finish().await.ok();
@@ -204,10 +190,141 @@ async fn send_input_events(conn: &wtransport::Connection) -> Result<()> {
     Ok(())
 }
 
-async fn receive_display_test_pattern(conn: &wtransport::Connection) -> Result<()> {
-    let mut recv = conn.accept_uni().await.context("accept Display uni")?;
-    println!("accepted Display uni stream");
+async fn write_input_keyevent(stream: &mut SendStream, ev: &KeyEvent) -> Result<()> {
+    let mut payload = Vec::new();
+    ev.write_to(&mut payload);
+    write_frame(stream, InputFrameType::KeyEvent as u8, &payload).await
+}
 
+async fn write_input_textinput(stream: &mut SendStream, ev: &TextInput) -> Result<()> {
+    let mut payload = Vec::new();
+    ev.write_to(&mut payload);
+    write_frame(stream, InputFrameType::TextInput as u8, &payload).await
+}
+
+// ===== Clipboard channel ===============================================
+
+async fn open_channel_and_exercise_clipboard(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    let oc = encode_open_channel(ChannelKind::CLIPBOARD.0 as u64, 2, 6);
+    write_frame(send, ControlFrameType::OpenChannel as u8, &oc).await?;
+    println!("\nsent OpenChannel(Clipboard, channel_id=2)");
+
+    expect_ack(recv, "Clipboard").await?;
+
+    let (mut clip_send, mut clip_recv) = conn.open_bi().await?.await?;
+    println!("opened Clipboard bidi stream");
+
+    // 1. Client announces what types it can offer (mirrors the spec's
+    //    OfferTypes; doesn't push content).
+    let offer = Cbor::Array(vec![Cbor::Text(
+        "text/plain;charset=utf-8".to_owned(),
+    )]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&offer, &mut buf)?;
+    write_frame(&mut clip_send, ClipboardFrameType::OfferTypes as u8, &buf).await?;
+    println!("sent Clipboard::OfferTypes (text/plain)");
+
+    // 2. Client requests the server's clipboard.
+    let req = Cbor::Map(vec![
+        (
+            Cbor::Integer(1u32.into()),
+            Cbor::Text("text/plain;charset=utf-8".to_owned()),
+        ),
+        (Cbor::Integer(2u32.into()), Cbor::Integer(42u32.into())),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&req, &mut buf)?;
+    write_frame(
+        &mut clip_send,
+        ClipboardFrameType::RequestContent as u8,
+        &buf,
+    )
+    .await?;
+    println!("sent Clipboard::RequestContent (request_id=42, text/plain)");
+
+    // 3. Receive server's clipboard content.
+    let content_bytes = read_frame(&mut clip_recv).await?;
+    let (frame, _) = Frame::parse(&content_bytes)?;
+    if frame.header.frame_type != ClipboardFrameType::Content as u8 {
+        bail!(
+            "expected Clipboard::Content (0x03), got 0x{:02x}",
+            frame.header.frame_type
+        );
+    }
+    let v: Cbor = ciborium::de::from_reader(frame.payload)?;
+    let (request_id, mime, bytes) = parse_clipboard_content(&v);
+    println!(
+        "recv Clipboard::Content request_id={request_id} mime={mime} bytes=\"{}\"",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // 4. Push the client's own clipboard back (server will log it).
+    let content_to_send = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer(100u32.into())),
+        (
+            Cbor::Integer(2u32.into()),
+            Cbor::Text("text/plain;charset=utf-8".to_owned()),
+        ),
+        (
+            Cbor::Integer(3u32.into()),
+            Cbor::Bytes(
+                "client clipboard: hello back from the test client"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+        (Cbor::Integer(4u32.into()), Cbor::Bool(false)),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&content_to_send, &mut buf)?;
+    write_frame(&mut clip_send, ClipboardFrameType::Content as u8, &buf).await?;
+    println!("sent Clipboard::Content (back to server)");
+
+    clip_send.finish().await.ok();
+    println!("finished Clipboard bidi stream");
+    Ok(())
+}
+
+fn parse_clipboard_content(v: &Cbor) -> (u64, String, Vec<u8>) {
+    let mut request_id: u64 = 0;
+    let mut mime = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        request_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        mime = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(b) = val.as_bytes() {
+                        bytes = b.to_vec();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (request_id, mime, bytes)
+}
+
+// ===== Display receiver ===============================================
+
+async fn receive_display(mut recv: RecvStream) -> Result<()> {
     let mut params_count = 0u32;
     let mut header_count = 0u32;
     let mut slice_count = 0u32;
@@ -229,45 +346,101 @@ async fn receive_display_test_pattern(conn: &wtransport::Connection) -> Result<(
                     let width = u16::from_le_bytes([frame.payload[1], frame.payload[2]]);
                     let height = u16::from_le_bytes([frame.payload[3], frame.payload[4]]);
                     println!(
-                        "Display::StreamParameters codec=0x{codec:02x} {width}x{height} ({} payload B)",
-                        frame.payload.len()
+                        "Display::StreamParameters codec=0x{codec:02x} {width}x{height}"
                     );
                 }
                 params_count += 1;
             }
-            DisplayFrameType::FrameHeader => {
-                if frame.payload.len() >= 15 {
-                    let frame_id = u32::from_le_bytes([
-                        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
-                    ]);
-                    let flags = frame.payload[4];
-                    let n_slices = frame.payload[13];
-                    println!(
-                        "Display::FrameHeader id={frame_id} flags=0x{flags:02x} n_slices={n_slices}"
-                    );
-                }
-                header_count += 1;
-            }
+            DisplayFrameType::FrameHeader => header_count += 1,
             DisplayFrameType::FrameSlice => slice_count += 1,
-            DisplayFrameType::FrameEnd => {
-                if frame.payload.len() >= 4 {
-                    let frame_id = u32::from_le_bytes([
-                        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
-                    ]);
-                    println!("Display::FrameEnd id={frame_id}");
-                }
-                end_count += 1;
-            }
+            DisplayFrameType::FrameEnd => end_count += 1,
         }
     }
 
     println!(
-        "Display stream summary: params={params_count} frames={header_count} slices={slice_count} ends={end_count} bytes={total_bytes}"
+        "Display summary: params={params_count} frames={header_count} slices={slice_count} ends={end_count} bytes={total_bytes}"
     );
     Ok(())
 }
 
-async fn read_frame_opt(recv: &mut wtransport::RecvStream) -> Result<Option<Vec<u8>>> {
+// ===== Cursor receiver ================================================
+
+async fn receive_cursor(mut recv: RecvStream) -> Result<()> {
+    let mut shape_count = 0u32;
+    let mut move_count = 0u32;
+    let mut hidden_count = 0u32;
+    let mut total_bytes = 0u64;
+    let mut last_move = (0i32, 0i32);
+
+    loop {
+        let frame_bytes = match read_frame_opt(&mut recv).await? {
+            Some(b) => b,
+            None => break,
+        };
+        total_bytes += frame_bytes.len() as u64;
+        let (frame, _) = Frame::parse(&frame_bytes)?;
+        let kind = CursorFrameType::from_u8(frame.header.frame_type)?;
+        match kind {
+            CursorFrameType::CursorShape => {
+                if frame.payload.len() >= 11 {
+                    let w = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
+                    let h = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+                    let fmt = frame.payload[8];
+                    println!("Cursor::CursorShape {w}x{h} format=0x{fmt:02x}");
+                }
+                shape_count += 1;
+            }
+            CursorFrameType::CursorMove => {
+                if frame.payload.len() >= 8 {
+                    let x = i32::from_le_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]);
+                    let y = i32::from_le_bytes([
+                        frame.payload[4],
+                        frame.payload[5],
+                        frame.payload[6],
+                        frame.payload[7],
+                    ]);
+                    last_move = (x, y);
+                }
+                move_count += 1;
+            }
+            CursorFrameType::CursorHidden => hidden_count += 1,
+        }
+    }
+
+    println!(
+        "Cursor summary: shapes={shape_count} moves={move_count} hidden={hidden_count} last_move={last_move:?} bytes={total_bytes}"
+    );
+    Ok(())
+}
+
+// ===== Wire helpers ===================================================
+
+async fn write_frame(stream: &mut SendStream, frame_type: u8, payload: &[u8]) -> Result<()> {
+    let mut buf = Vec::with_capacity(FrameHeader::SIZE + payload.len());
+    Frame::encode(frame_type, payload, &mut buf);
+    stream.write_all(&buf).await?;
+    Ok(())
+}
+
+async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
+    let mut header_buf = [0u8; FrameHeader::SIZE];
+    read_exact_inner(recv, &mut header_buf).await?;
+    let h = FrameHeader::parse(&header_buf)?;
+    if (h.length as usize) > MAX_FRAME_LENGTH {
+        bail!("oversized frame: {} bytes", h.length);
+    }
+    let mut full = vec![0u8; FrameHeader::SIZE + h.length as usize];
+    full[..FrameHeader::SIZE].copy_from_slice(&header_buf);
+    read_exact_inner(recv, &mut full[FrameHeader::SIZE..]).await?;
+    Ok(full)
+}
+
+async fn read_frame_opt(recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
     let mut header_buf = [0u8; FrameHeader::SIZE];
     let mut filled = 0;
     while filled < FrameHeader::SIZE {
@@ -291,47 +464,7 @@ async fn read_frame_opt(recv: &mut wtransport::RecvStream) -> Result<Option<Vec<
     Ok(Some(full))
 }
 
-trait WriteInputPayload {
-    fn write_payload(&self, out: &mut Vec<u8>);
-}
-impl WriteInputPayload for KeyEvent {
-    fn write_payload(&self, out: &mut Vec<u8>) {
-        self.write_to(out)
-    }
-}
-impl WriteInputPayload for TextInput {
-    fn write_payload(&self, out: &mut Vec<u8>) {
-        self.write_to(out)
-    }
-}
-
-async fn write_input_frame<T: WriteInputPayload>(
-    stream: &mut wtransport::SendStream,
-    frame_type: InputFrameType,
-    msg: &T,
-) -> Result<()> {
-    let mut payload = Vec::new();
-    msg.write_payload(&mut payload);
-    let mut frame = Vec::with_capacity(FrameHeader::SIZE + payload.len());
-    Frame::encode(frame_type as u8, &payload, &mut frame);
-    stream.write_all(&frame).await?;
-    Ok(())
-}
-
-async fn read_frame(recv: &mut wtransport::RecvStream) -> Result<Vec<u8>> {
-    let mut header_buf = [0u8; FrameHeader::SIZE];
-    read_exact_inner(recv, &mut header_buf).await?;
-    let h = FrameHeader::parse(&header_buf)?;
-    if (h.length as usize) > MAX_FRAME_LENGTH {
-        bail!("oversized frame: {} bytes", h.length);
-    }
-    let mut full = vec![0u8; FrameHeader::SIZE + h.length as usize];
-    full[..FrameHeader::SIZE].copy_from_slice(&header_buf);
-    read_exact_inner(recv, &mut full[FrameHeader::SIZE..]).await?;
-    Ok(full)
-}
-
-async fn read_exact_inner(recv: &mut wtransport::RecvStream, buf: &mut [u8]) -> Result<()> {
+async fn read_exact_inner(recv: &mut RecvStream, buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         match recv.read(&mut buf[filled..]).await? {
@@ -341,6 +474,26 @@ async fn read_exact_inner(recv: &mut wtransport::RecvStream, buf: &mut [u8]) -> 
     }
     Ok(())
 }
+
+async fn expect_ack(recv: &mut RecvStream, label: &str) -> Result<()> {
+    let bytes = read_frame(recv).await?;
+    let (frame, _) = Frame::parse(&bytes)?;
+    if frame.header.frame_type != ControlFrameType::OpenChannelAck as u8 {
+        bail!(
+            "expected OpenChannelAck for {label}, got 0x{:02x}",
+            frame.header.frame_type
+        );
+    }
+    let v: Cbor = ciborium::de::from_reader(frame.payload)?;
+    let (channel_id, status) = parse_open_channel_ack(&v);
+    println!("recv OpenChannelAck ({label}): channel_id={channel_id} status={status}");
+    if status != 0 {
+        bail!("server refused {label}: status {status}");
+    }
+    Ok(())
+}
+
+// ===== CBOR helpers ===================================================
 
 fn encode_client_hello(caps: &Capabilities) -> Vec<u8> {
     let value = Cbor::Map(vec![
@@ -375,35 +528,25 @@ fn describe_server_hello(v: &Cbor) -> Capabilities {
             None => continue,
         };
         match key {
-            1 => {
-                let n = val.as_integer().and_then(|i| u64::try_from(i).ok()).unwrap_or(0);
-                println!("  protocol_version: {n}");
-            }
-            2 => {
-                let s = val.as_text().unwrap_or("?");
-                println!("  server_name:      \"{s}\"");
-            }
+            1 => println!(
+                "  protocol_version: {}",
+                val.as_integer().and_then(|i| u64::try_from(i).ok()).unwrap_or(0)
+            ),
+            2 => println!("  server_name:      \"{}\"", val.as_text().unwrap_or("?")),
             3 => {
                 server_caps = Capabilities::from_cbor(val);
-                println!("  capabilities:");
-                println!("    profile:        {}", server_caps.profile);
-                println!("    auth_methods:   {:?}", server_caps.auth_methods);
-                println!("    display_codecs: {:?}", server_caps.display_codecs);
-                println!("    audio_codecs:   {:?}", server_caps.audio_codecs);
-                println!(
-                    "    max_resolution: {}x{}",
-                    server_caps.display_max_resolution.0,
-                    server_caps.display_max_resolution.1
-                );
+                println!("  capabilities.profile:        {}", server_caps.profile);
+                println!("  capabilities.auth_methods:   {:?}", server_caps.auth_methods);
+                println!("  capabilities.display_codecs: {:?}", server_caps.display_codecs);
             }
-            4 => {
-                let h = val.as_bytes().map(hex::encode).unwrap_or_else(|| "?".into());
-                println!("  session_id:       {h}");
-            }
-            5 => {
-                let n = val.as_integer().and_then(|i| u64::try_from(i).ok()).unwrap_or(0);
-                println!("  server_time:      {n}");
-            }
+            4 => println!(
+                "  session_id:       {}",
+                val.as_bytes().map(hex::encode).unwrap_or_else(|| "?".into())
+            ),
+            5 => println!(
+                "  server_time:      {}",
+                val.as_integer().and_then(|i| u64::try_from(i).ok()).unwrap_or(0)
+            ),
             _ => {}
         }
     }
@@ -463,6 +606,39 @@ fn encode_open_channel(kind: u64, channel_id: u64, stream_id: u64) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::ser::into_writer(&value, &mut out).expect("encode OpenChannel");
     out
+}
+
+fn parse_open_channel(v: &Cbor) -> (u64, u64, u64) {
+    let mut kind: u64 = 0;
+    let mut channel_id: u64 = 0;
+    let mut stream_id: u64 = 0;
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        kind = n;
+                    }
+                }
+                2 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        channel_id = n;
+                    }
+                }
+                3 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        stream_id = n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (kind, channel_id, stream_id)
 }
 
 fn parse_open_channel_ack(v: &Cbor) -> (u64, u32) {
