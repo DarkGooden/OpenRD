@@ -7,11 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
+use openrd_proto::display::DisplayFrameType;
 use openrd_proto::input::{InputFrameType, KeyEvent, TextInput};
 use openrd_proto::{
     Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
     ProtocolVersion, MAX_FRAME_LENGTH,
 };
+use std::time::Duration;
 use tracing::{info, warn};
 use wtransport::{Connection, RecvStream, SendStream};
 
@@ -175,14 +177,125 @@ pub async fn handle_control_stream(
     send.write_all(&ack_frame).await?;
     info!(%remote, channel_id, "sent OpenChannelAck(OK)");
 
+    // Run Display test pattern (server → client) concurrently with
+    // draining the Input uni stream (client → server). They finish
+    // independently when each side closes.
+    let display_fut = run_display_test_pattern(conn, remote);
+    let input_fut = drain_input_channel(conn, remote);
+    let (d, i) = tokio::join!(display_fut, input_fut);
+    d.context("Display task")?;
+    i.context("Input task")?;
+
+    Ok(())
+}
+
+async fn drain_input_channel(conn: &Connection, remote: SocketAddr) -> Result<()> {
     let input_recv = conn
         .accept_uni()
         .await
         .context("accept Input uni stream")?;
     info!(%remote, "accepted Input uni stream");
-    handle_input_stream(input_recv, remote).await?;
+    handle_input_stream(input_recv, remote).await
+}
 
+/// Open a server-initiated unidirectional stream for the Display
+/// channel and emit a small synthetic test pattern: StreamParameters
+/// + 5 frames (1 IDR, 4 P) at ~30 fps with placeholder NAL bytes.
+async fn run_display_test_pattern(conn: &Connection, remote: SocketAddr) -> Result<()> {
+    let mut stream = conn.open_uni().await?.await?;
+    info!(%remote, "opened Display uni stream");
+
+    let sp = build_stream_parameters(
+        0x01, // H.264 Baseline
+        1920, 1080,
+        // Placeholder SPS / PPS bytes; structurally valid lengths but
+        // not a real bitstream. Sufficient for wire-format testing.
+        &[0x67, 0x42, 0x00, 0x1e, 0x96, 0x35, 0x40],
+        &[0x68, 0xce, 0x38, 0x80],
+    );
+    let mut frame_buf = Vec::with_capacity(FrameHeader::SIZE + sp.len());
+    Frame::encode(
+        DisplayFrameType::StreamParameters as u8,
+        &sp,
+        &mut frame_buf,
+    );
+    stream.write_all(&frame_buf).await?;
+    info!(%remote, "sent Display::StreamParameters (1920x1080, H.264 Baseline)");
+
+    const FRAME_COUNT: u32 = 5;
+    const N_SLICES: u8 = 4;
+    const SLICE_PAYLOAD_BYTES: usize = 256;
+
+    for frame_id in 0..FRAME_COUNT {
+        let timestamp_us = (frame_id as u64) * 33_333; // ~30 fps
+        let is_idr = frame_id == 0;
+        let flags: u8 = if is_idr { 0x01 } else { 0x00 };
+
+        // FrameHeader (type 0x01).
+        let mut header = Vec::with_capacity(15);
+        header.extend(&frame_id.to_le_bytes());
+        header.push(flags);
+        header.extend(&timestamp_us.to_le_bytes());
+        header.push(N_SLICES);
+        header.push(0); // reserved
+        let mut fh_frame = Vec::with_capacity(FrameHeader::SIZE + header.len());
+        Frame::encode(
+            DisplayFrameType::FrameHeader as u8,
+            &header,
+            &mut fh_frame,
+        );
+        stream.write_all(&fh_frame).await?;
+
+        // N slices.
+        for slice_idx in 0..N_SLICES {
+            let nal = vec![0xFFu8 ^ slice_idx; SLICE_PAYLOAD_BYTES];
+            let mut slice = Vec::with_capacity(10 + nal.len());
+            slice.extend(&frame_id.to_le_bytes());
+            slice.push(slice_idx);
+            slice.push(N_SLICES);
+            slice.extend(&(nal.len() as u32).to_le_bytes());
+            slice.extend(&nal);
+            let mut s_frame = Vec::with_capacity(FrameHeader::SIZE + slice.len());
+            Frame::encode(
+                DisplayFrameType::FrameSlice as u8,
+                &slice,
+                &mut s_frame,
+            );
+            stream.write_all(&s_frame).await?;
+        }
+
+        // FrameEnd.
+        let fe = frame_id.to_le_bytes().to_vec();
+        let mut fe_frame = Vec::with_capacity(FrameHeader::SIZE + fe.len());
+        Frame::encode(DisplayFrameType::FrameEnd as u8, &fe, &mut fe_frame);
+        stream.write_all(&fe_frame).await?;
+
+        info!(
+            %remote,
+            frame_id,
+            idr = is_idr,
+            n_slices = N_SLICES,
+            timestamp_us,
+            "sent Display frame"
+        );
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+
+    stream.finish().await.ok();
+    info!(%remote, frames = FRAME_COUNT, "finished Display uni stream");
     Ok(())
+}
+
+fn build_stream_parameters(codec: u8, width: u16, height: u16, sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + 2 + sps.len() + 2 + pps.len());
+    out.push(codec);
+    out.extend(&width.to_le_bytes());
+    out.extend(&height.to_le_bytes());
+    out.extend(&(sps.len() as u16).to_le_bytes());
+    out.extend(sps);
+    out.extend(&(pps.len() as u16).to_le_bytes());
+    out.extend(pps);
+    out
 }
 
 async fn handle_input_stream(mut recv: RecvStream, remote: SocketAddr) -> Result<()> {

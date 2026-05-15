@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
+use openrd_proto::display::DisplayFrameType;
 use openrd_proto::input::{InputFrameType, KeyEvent, Modifiers, TextInput};
 use openrd_proto::{
     Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
@@ -161,6 +162,20 @@ async fn main() -> Result<()> {
         bail!("server refused channel: status {ack_status}");
     }
 
+    // Concurrently: send Input events (client → server) and receive
+    // the Display channel test pattern (server → client).
+    let input_fut = send_input_events(&conn);
+    let display_fut = receive_display_test_pattern(&conn);
+    let (i, d) = tokio::join!(input_fut, display_fut);
+    i.context("Input task")?;
+    d.context("Display task")?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    conn.close(0u32.into(), b"bye");
+    Ok(())
+}
+
+async fn send_input_events(conn: &wtransport::Connection) -> Result<()> {
     let mut input_stream = conn.open_uni().await?.await?;
     println!("opened Input uni stream");
 
@@ -186,11 +201,94 @@ async fn main() -> Result<()> {
 
     input_stream.finish().await.ok();
     println!("finished Input uni stream");
-
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    conn.close(0u32.into(), b"bye");
     Ok(())
+}
+
+async fn receive_display_test_pattern(conn: &wtransport::Connection) -> Result<()> {
+    let mut recv = conn.accept_uni().await.context("accept Display uni")?;
+    println!("accepted Display uni stream");
+
+    let mut params_count = 0u32;
+    let mut header_count = 0u32;
+    let mut slice_count = 0u32;
+    let mut end_count = 0u32;
+    let mut total_bytes = 0u64;
+
+    loop {
+        let frame_bytes = match read_frame_opt(&mut recv).await? {
+            Some(b) => b,
+            None => break,
+        };
+        total_bytes += frame_bytes.len() as u64;
+        let (frame, _) = Frame::parse(&frame_bytes)?;
+        let kind = DisplayFrameType::from_u8(frame.header.frame_type)?;
+        match kind {
+            DisplayFrameType::StreamParameters => {
+                if frame.payload.len() >= 5 {
+                    let codec = frame.payload[0];
+                    let width = u16::from_le_bytes([frame.payload[1], frame.payload[2]]);
+                    let height = u16::from_le_bytes([frame.payload[3], frame.payload[4]]);
+                    println!(
+                        "Display::StreamParameters codec=0x{codec:02x} {width}x{height} ({} payload B)",
+                        frame.payload.len()
+                    );
+                }
+                params_count += 1;
+            }
+            DisplayFrameType::FrameHeader => {
+                if frame.payload.len() >= 15 {
+                    let frame_id = u32::from_le_bytes([
+                        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
+                    ]);
+                    let flags = frame.payload[4];
+                    let n_slices = frame.payload[13];
+                    println!(
+                        "Display::FrameHeader id={frame_id} flags=0x{flags:02x} n_slices={n_slices}"
+                    );
+                }
+                header_count += 1;
+            }
+            DisplayFrameType::FrameSlice => slice_count += 1,
+            DisplayFrameType::FrameEnd => {
+                if frame.payload.len() >= 4 {
+                    let frame_id = u32::from_le_bytes([
+                        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
+                    ]);
+                    println!("Display::FrameEnd id={frame_id}");
+                }
+                end_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "Display stream summary: params={params_count} frames={header_count} slices={slice_count} ends={end_count} bytes={total_bytes}"
+    );
+    Ok(())
+}
+
+async fn read_frame_opt(recv: &mut wtransport::RecvStream) -> Result<Option<Vec<u8>>> {
+    let mut header_buf = [0u8; FrameHeader::SIZE];
+    let mut filled = 0;
+    while filled < FrameHeader::SIZE {
+        match recv.read(&mut header_buf[filled..]).await? {
+            Some(0) | None => {
+                if filled == 0 {
+                    return Ok(None);
+                }
+                bail!("stream ended mid-header ({filled}/6 bytes)");
+            }
+            Some(n) => filled += n,
+        }
+    }
+    let h = FrameHeader::parse(&header_buf)?;
+    if (h.length as usize) > MAX_FRAME_LENGTH {
+        bail!("oversized frame: {} bytes", h.length);
+    }
+    let mut full = vec![0u8; FrameHeader::SIZE + h.length as usize];
+    full[..FrameHeader::SIZE].copy_from_slice(&header_buf);
+    read_exact_inner(recv, &mut full[FrameHeader::SIZE..]).await?;
+    Ok(Some(full))
 }
 
 trait WriteInputPayload {
