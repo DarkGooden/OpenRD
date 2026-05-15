@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
 use openrd_proto::{
-    Capabilities, Frame, FrameHeader, NegotiatedProfile, ALPN, MAX_FRAME_LENGTH,
+    Capabilities, ErrorCode, Frame, FrameHeader, NegotiatedProfile, ALPN, MAX_FRAME_LENGTH,
     PROTOCOL_VERSION,
 };
 use quinn::{ClientConfig, Endpoint};
@@ -92,25 +92,110 @@ async fn main() -> Result<()> {
     let server_caps = describe_server_hello(&value);
 
     // Compute the negotiated profile and print it.
-    match NegotiatedProfile::negotiate(&client_caps, &server_caps) {
-        Ok(profile) => {
+    let profile = match NegotiatedProfile::negotiate(&client_caps, &server_caps) {
+        Ok(p) => {
             println!("Negotiated profile:");
-            println!("  version:           {}", profile.version);
-            println!("  display_codec:     {}", profile.display_codec);
-            println!("  display_resolution: {}x{}", profile.display_resolution.0, profile.display_resolution.1);
-            println!("  display_max_fps:   {}", profile.display_max_fps);
-            println!("  audio_codec:       {}", profile.audio_codec.as_deref().unwrap_or("(none)"));
-            println!("  auth_methods:      {:?}", profile.auth_methods);
-            println!("  chat_enabled:      {}", profile.chat_enabled);
+            println!("  version:           {}", p.version);
+            println!("  display_codec:     {}", p.display_codec);
+            println!("  display_resolution: {}x{}", p.display_resolution.0, p.display_resolution.1);
+            println!("  display_max_fps:   {}", p.display_max_fps);
+            println!("  audio_codec:       {}", p.audio_codec.as_deref().unwrap_or("(none)"));
+            println!("  auth_methods:      {:?}", p.auth_methods);
+            println!("  chat_enabled:      {}", p.chat_enabled);
+            p
         }
-        Err(e) => {
-            anyhow::bail!("capability negotiation failed: {e}");
-        }
+        Err(e) => bail!("capability negotiation failed: {e}"),
+    };
+
+    // --- AuthRequest ------------------------------------------------------
+    let pin = std::env::var("OPENRD_PIN").unwrap_or_else(|_| {
+        eprintln!("warning: OPENRD_PIN not set; sending empty PIN (will fail auth)");
+        String::new()
+    });
+    if !profile.auth_methods.iter().any(|m| m == "pin") {
+        bail!("server doesn't support PIN auth (offers {:?})", profile.auth_methods);
+    }
+
+    let auth_payload = encode_auth_request("pin", pin.as_bytes());
+    let mut frame_buf = Vec::with_capacity(FrameHeader::SIZE + auth_payload.len());
+    Frame::encode(
+        ControlFrameType::AuthRequest as u8,
+        &auth_payload,
+        &mut frame_buf,
+    );
+    send.write_all(&frame_buf).await?;
+    println!("\nsent AuthRequest (method=pin, credential={} B)", pin.len());
+
+    let bytes = read_frame(&mut recv).await?;
+    let (parsed, _) = Frame::parse(&bytes)?;
+    println!(
+        "recv frame: ver={} type=0x{:02x} len={}",
+        parsed.header.version.0, parsed.header.frame_type, parsed.header.length
+    );
+    if parsed.header.frame_type != ControlFrameType::AuthResult as u8 {
+        bail!(
+            "expected AuthResult (0x05), got 0x{:02x}",
+            parsed.header.frame_type
+        );
+    }
+    let auth_result: Cbor = ciborium::de::from_reader(parsed.payload)
+        .context("decode AuthResult")?;
+    let (status, permission, identity) = parse_auth_result(&auth_result);
+    println!("AuthResult:");
+    println!("  status:     {status} ({:?})", ErrorCode::from_u16(status as u16));
+    println!("  permission: {permission}");
+    println!("  identity:   {identity}");
+
+    if status != 0 {
+        bail!("auth failed");
     }
 
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+fn encode_auth_request(method: &str, credential: &[u8]) -> Vec<u8> {
+    let value = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Text(method.to_owned())),
+        (Cbor::Integer(2u32.into()), Cbor::Bytes(credential.to_vec())),
+    ]);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out).expect("encode AuthRequest");
+    out
+}
+
+fn parse_auth_result(v: &Cbor) -> (u32, String, String) {
+    let mut status: u32 = 0;
+    let mut permission = String::new();
+    let mut identity = String::new();
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        status = n as u32;
+                    }
+                }
+                2 => {
+                    if let Some(s) = val.as_text() {
+                        permission = s.to_owned();
+                    }
+                }
+                3 => {
+                    if let Some(s) = val.as_text() {
+                        identity = s.to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (status, permission, identity)
 }
 
 fn encode_client_hello(caps: &Capabilities) -> Vec<u8> {

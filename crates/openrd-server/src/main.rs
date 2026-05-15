@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use quinn::{Endpoint, ServerConfig};
+use rand::Rng;
 use tracing::{info, warn};
 
 use openrd_proto::ALPN;
@@ -40,13 +41,21 @@ async fn main() -> Result<()> {
     let listen: SocketAddr = LISTEN_ADDR.parse()?;
     let server_config = make_server_config()?;
     let endpoint = Endpoint::server(server_config, listen)?;
+
+    // Generate a 9-digit PIN for this server instance. Stable across
+    // connections during the server's lifetime.
+    let pin: String = format!("{:09}", rand::rng().random_range(0..1_000_000_000u32));
+    let pin = Arc::new(pin);
+    info!(pin = %pin, "OpenRD PIN issued for this server instance");
+
     info!("openrd-server listening on {listen} (ALPN openrd/v0)");
 
     while let Some(incoming) = endpoint.accept().await {
+        let pin = Arc::clone(&pin);
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle_connection(conn).await {
+                    if let Err(e) = handle_connection(conn, pin).await {
                         warn!("connection error: {e:#}");
                     }
                 }
@@ -58,7 +67,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(conn: quinn::Connection) -> Result<()> {
+async fn handle_connection(conn: quinn::Connection, pin: Arc<String>) -> Result<()> {
     let remote = conn.remote_address();
     info!(%remote, "new connection");
 
@@ -69,8 +78,8 @@ async fn handle_connection(conn: quinn::Connection) -> Result<()> {
         .context("accept Control bidi stream")?;
     info!(%remote, "accepted Control bidi stream");
 
-    if let Err(e) = control::handle_control_stream(send, recv, remote).await {
-        warn!(%remote, "Control hello exchange failed: {e:#}");
+    if let Err(e) = control::handle_control_stream(send, recv, remote, &pin).await {
+        warn!(%remote, "Control flow failed: {e:#}");
     }
 
     conn.closed().await;
