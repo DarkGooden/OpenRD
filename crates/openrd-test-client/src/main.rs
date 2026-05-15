@@ -19,9 +19,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
+use openrd_proto::input::{InputFrameType, KeyEvent, Modifiers, TextInput};
 use openrd_proto::{
-    Capabilities, ErrorCode, Frame, FrameHeader, NegotiatedProfile, ALPN, MAX_FRAME_LENGTH,
-    PROTOCOL_VERSION,
+    Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile, ALPN,
+    MAX_FRAME_LENGTH, PROTOCOL_VERSION,
 };
 use quinn::{ClientConfig, Endpoint};
 
@@ -150,9 +151,134 @@ async fn main() -> Result<()> {
         bail!("auth failed");
     }
 
+    // --- OpenChannel(Input) + send a few events ---------------------------
+    let oc_payload = encode_open_channel(ChannelKind::INPUT.0 as u64, 1, 2);
+    let mut oc_frame = Vec::with_capacity(FrameHeader::SIZE + oc_payload.len());
+    Frame::encode(
+        ControlFrameType::OpenChannel as u8,
+        &oc_payload,
+        &mut oc_frame,
+    );
+    send.write_all(&oc_frame).await?;
+    println!("\nsent OpenChannel(Input, channel_id=1)");
+
+    let ack_bytes = read_frame(&mut recv).await?;
+    let (ack_frame, _) = Frame::parse(&ack_bytes)?;
+    if ack_frame.header.frame_type != ControlFrameType::OpenChannelAck as u8 {
+        bail!(
+            "expected OpenChannelAck (0x07), got 0x{:02x}",
+            ack_frame.header.frame_type
+        );
+    }
+    let ack_val: Cbor =
+        ciborium::de::from_reader(ack_frame.payload).context("decode OpenChannelAck")?;
+    let (ack_channel_id, ack_status) = parse_open_channel_ack(&ack_val);
+    println!("recv OpenChannelAck: channel_id={ack_channel_id} status={ack_status}");
+    if ack_status != 0 {
+        bail!("server refused channel: status {ack_status}");
+    }
+
+    // Open the unidirectional Input stream and push a few events.
+    let mut input_stream = conn.open_uni().await.context("open Input uni stream")?;
+    println!("opened Input uni stream");
+
+    let key_a_down = KeyEvent {
+        keysym: 0x0061, // 'a'
+        scancode: 0x001E,
+        modifiers: Modifiers::default(),
+        flags: 0x01,
+    };
+    write_input_frame(&mut input_stream, InputFrameType::KeyEvent, &key_a_down).await?;
+    println!("sent KeyEvent (keysym=0x61 'a' down)");
+
+    let mut key_a_up = key_a_down;
+    key_a_up.flags = 0x00;
+    write_input_frame(&mut input_stream, InputFrameType::KeyEvent, &key_a_up).await?;
+    println!("sent KeyEvent (keysym=0x61 'a' up)");
+
+    let text = TextInput {
+        text: "olá, mundo 🌍".to_owned(),
+    };
+    write_input_frame(&mut input_stream, InputFrameType::TextInput, &text).await?;
+    println!("sent TextInput (\"olá, mundo 🌍\")");
+
+    input_stream.finish().ok();
+    println!("finished Input uni stream");
+
+    // Give the server a moment to drain before closing the connection.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+/// Encode an Input-channel payload via a small trait so we can write
+/// KeyEvent and TextInput with one helper.
+trait WriteInputPayload {
+    fn write_payload(&self, out: &mut Vec<u8>);
+}
+impl WriteInputPayload for KeyEvent {
+    fn write_payload(&self, out: &mut Vec<u8>) {
+        self.write_to(out)
+    }
+}
+impl WriteInputPayload for TextInput {
+    fn write_payload(&self, out: &mut Vec<u8>) {
+        self.write_to(out)
+    }
+}
+
+async fn write_input_frame<T: WriteInputPayload>(
+    stream: &mut quinn::SendStream,
+    frame_type: InputFrameType,
+    msg: &T,
+) -> Result<()> {
+    let mut payload = Vec::new();
+    msg.write_payload(&mut payload);
+    let mut frame = Vec::with_capacity(FrameHeader::SIZE + payload.len());
+    Frame::encode(frame_type as u8, &payload, &mut frame);
+    stream.write_all(&frame).await?;
+    Ok(())
+}
+
+fn encode_open_channel(kind: u64, channel_id: u64, stream_id: u64) -> Vec<u8> {
+    let value = Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer(kind.into())),
+        (Cbor::Integer(2u32.into()), Cbor::Integer(channel_id.into())),
+        (Cbor::Integer(3u32.into()), Cbor::Integer(stream_id.into())),
+        (Cbor::Integer(4u32.into()), Cbor::Map(vec![])),
+    ]);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out).expect("encode OpenChannel");
+    out
+}
+
+fn parse_open_channel_ack(v: &Cbor) -> (u64, u32) {
+    let mut channel_id: u64 = 0;
+    let mut status: u32 = 0;
+    if let Some(map) = v.as_map() {
+        for (k, val) in map {
+            let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                Some(k) => k,
+                None => continue,
+            };
+            match key {
+                1 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        channel_id = n;
+                    }
+                }
+                2 => {
+                    if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                        status = n as u32;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (channel_id, status)
 }
 
 fn encode_auth_request(method: &str, credential: &[u8]) -> Vec<u8> {

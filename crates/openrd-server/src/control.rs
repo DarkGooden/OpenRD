@@ -11,20 +11,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use ciborium::Value as Cbor;
 use openrd_proto::control::ControlFrameType;
+use openrd_proto::input::{InputFrameType, KeyEvent, TextInput};
 use openrd_proto::{
-    Capabilities, ErrorCode, Frame, FrameHeader, NegotiatedProfile, ProtocolVersion,
-    MAX_FRAME_LENGTH,
+    Capabilities, ChannelKind, ErrorCode, Frame, FrameHeader, NegotiatedProfile,
+    ProtocolVersion, MAX_FRAME_LENGTH,
 };
-use quinn::{RecvStream, SendStream};
+use quinn::{Connection, ReadExactError, RecvStream, SendStream};
 use tracing::{info, warn};
 
-/// Run the hello exchange and PIN authentication on the Control
-/// bidirectional stream.
-///
-/// On success the function returns; the rest of the Control loop
-/// (channel dispatch, keepalive, etc.) is not yet implemented and
-/// the caller will close the connection.
+/// Run the hello exchange, PIN authentication, and one round of
+/// channel negotiation (Input only, for v0 scaffolding).
 pub async fn handle_control_stream(
+    conn: &Connection,
     mut send: SendStream,
     mut recv: RecvStream,
     remote: SocketAddr,
@@ -153,9 +151,102 @@ pub async fn handle_control_stream(
         return Ok(());
     }
 
-    // TODO: post-auth Control loop — channel open/close, pings, etc.
-    // Returns here; caller closes the connection.
+    // --- OpenChannel(Input) ----------------------------------------------
+    // v0 scaffold: accept exactly one OpenChannel for the Input channel,
+    // then read events off a client-opened unidirectional QUIC stream.
+    let oc_bytes = read_full_frame(&mut recv).await?;
+    let (oc_frame, _) = Frame::parse(&oc_bytes)?;
+    if oc_frame.header.frame_type != ControlFrameType::OpenChannel as u8 {
+        bail!(
+            "expected OpenChannel (0x06), got 0x{:02x}",
+            oc_frame.header.frame_type
+        );
+    }
+    let oc_val: Cbor =
+        ciborium::de::from_reader(oc_frame.payload).context("decode OpenChannel")?;
+    let (kind, channel_id, _stream_id) = parse_open_channel(&oc_val)?;
+    info!(
+        %remote,
+        kind = format!("0x{kind:04x}"),
+        channel_id,
+        "received OpenChannel"
+    );
+
+    if kind != ChannelKind::INPUT.0 as u64 {
+        warn!(%remote, "v0 scaffold accepts Input channel only");
+        let ack = build_open_channel_ack(channel_id, ErrorCode::NotImplemented as u32);
+        let mut ack_payload = Vec::new();
+        ciborium::ser::into_writer(&ack, &mut ack_payload)?;
+        let mut ack_frame = Vec::with_capacity(FrameHeader::SIZE + ack_payload.len());
+        Frame::encode(
+            ControlFrameType::OpenChannelAck as u8,
+            &ack_payload,
+            &mut ack_frame,
+        );
+        send.write_all(&ack_frame).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    // Ack OK.
+    let ack = build_open_channel_ack(channel_id, ErrorCode::Ok as u32);
+    let mut ack_payload = Vec::new();
+    ciborium::ser::into_writer(&ack, &mut ack_payload)?;
+    let mut ack_frame = Vec::with_capacity(FrameHeader::SIZE + ack_payload.len());
+    Frame::encode(
+        ControlFrameType::OpenChannelAck as u8,
+        &ack_payload,
+        &mut ack_frame,
+    );
+    send.write_all(&ack_frame).await?;
+    info!(%remote, channel_id, "sent OpenChannelAck(OK)");
+
+    // Accept the client's unidirectional Input stream and consume it.
+    let input_recv = conn
+        .accept_uni()
+        .await
+        .context("accept Input uni stream")?;
+    info!(%remote, "accepted Input uni stream");
+    handle_input_stream(input_recv, remote).await?;
+
     let _ = send.finish();
+    Ok(())
+}
+
+/// Read Input-channel frames off `recv` until the peer finishes the
+/// stream. Logs each event.
+async fn handle_input_stream(mut recv: RecvStream, remote: SocketAddr) -> Result<()> {
+    let mut count: u64 = 0;
+    loop {
+        let frame_bytes = match read_full_frame_opt(&mut recv).await? {
+            Some(b) => b,
+            None => break,
+        };
+        let (frame, _) = Frame::parse(&frame_bytes)?;
+        let kind = InputFrameType::from_u8(frame.header.frame_type)?;
+        match kind {
+            InputFrameType::KeyEvent => {
+                let ev = KeyEvent::parse(frame.payload)?;
+                info!(
+                    %remote,
+                    keysym = format!("0x{:04x}", ev.keysym),
+                    scancode = ev.scancode,
+                    modifiers = ev.modifiers.0,
+                    down = ev.down(),
+                    "Input::KeyEvent"
+                );
+            }
+            InputFrameType::TextInput => {
+                let ev = TextInput::parse(frame.payload)?;
+                info!(%remote, text = %ev.text, "Input::TextInput");
+            }
+            other => {
+                info!(%remote, ?other, len = frame.payload.len(), "Input::(unhandled)");
+            }
+        }
+        count += 1;
+    }
+    info!(%remote, count, "Input stream closed");
     Ok(())
 }
 
@@ -197,6 +288,62 @@ fn build_auth_result(status: u32, permission: &str, identity: &str) -> Cbor {
         (Cbor::Integer(2u32.into()), Cbor::Text(permission.to_owned())),
         (Cbor::Integer(3u32.into()), Cbor::Text(identity.to_owned())),
     ])
+}
+
+fn parse_open_channel(v: &Cbor) -> Result<(u64, u64, u64)> {
+    let map = v.as_map().ok_or_else(|| anyhow!("OpenChannel not a map"))?;
+    let mut kind: Option<u64> = None;
+    let mut channel_id: Option<u64> = None;
+    let mut stream_id: u64 = 0;
+    for (k, val) in map {
+        let key = match k.as_integer().and_then(|i| u64::try_from(i).ok()) {
+            Some(k) => k,
+            None => continue,
+        };
+        match key {
+            1 => kind = val.as_integer().and_then(|i| u64::try_from(i).ok()),
+            2 => channel_id = val.as_integer().and_then(|i| u64::try_from(i).ok()),
+            3 => {
+                if let Some(n) = val.as_integer().and_then(|i| u64::try_from(i).ok()) {
+                    stream_id = n;
+                }
+            }
+            _ => {}
+        }
+    }
+    let kind = kind.ok_or_else(|| anyhow!("OpenChannel missing key 1 (kind)"))?;
+    let channel_id =
+        channel_id.ok_or_else(|| anyhow!("OpenChannel missing key 2 (channel_id)"))?;
+    Ok((kind, channel_id, stream_id))
+}
+
+fn build_open_channel_ack(channel_id: u64, status: u32) -> Cbor {
+    Cbor::Map(vec![
+        (Cbor::Integer(1u32.into()), Cbor::Integer(channel_id.into())),
+        (Cbor::Integer(2u32.into()), Cbor::Integer((status as u64).into())),
+        (Cbor::Integer(3u32.into()), Cbor::Map(vec![])),
+    ])
+}
+
+/// Variant of `read_full_frame` that returns `Ok(None)` on a clean
+/// stream FIN (vs. erroring out).
+async fn read_full_frame_opt(recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
+    let mut header_buf = [0u8; FrameHeader::SIZE];
+    match recv.read_exact(&mut header_buf).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(e) => return Err(anyhow!("read frame header: {e}")),
+    }
+    let h = FrameHeader::parse(&header_buf)?;
+    if (h.length as usize) > MAX_FRAME_LENGTH {
+        bail!("frame too large: {} bytes", h.length);
+    }
+    let mut full = vec![0u8; FrameHeader::SIZE + h.length as usize];
+    full[..FrameHeader::SIZE].copy_from_slice(&header_buf);
+    recv.read_exact(&mut full[FrameHeader::SIZE..])
+        .await
+        .map_err(|e| anyhow!("read frame payload: {e}"))?;
+    Ok(Some(full))
 }
 
 /// Read exactly one complete frame (header + payload) from `recv`.

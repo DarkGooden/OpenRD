@@ -78,7 +78,7 @@ async fn handle_connection(conn: quinn::Connection, pin: Arc<String>) -> Result<
         .context("accept Control bidi stream")?;
     info!(%remote, "accepted Control bidi stream");
 
-    if let Err(e) = control::handle_control_stream(send, recv, remote, &pin).await {
+    if let Err(e) = control::handle_control_stream(&conn, send, recv, remote, &pin).await {
         warn!(%remote, "Control flow failed: {e:#}");
     }
 

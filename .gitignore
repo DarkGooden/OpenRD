@@ -20,6 +20,7 @@ Thumbs.db
 # Local build logs / one-off helpers
 build.log
 build-test.cmd
+smoke.log
 !docs/**/*.pem
 !docs/**/*.key
 .env
