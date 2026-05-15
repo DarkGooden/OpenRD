@@ -46,10 +46,31 @@ wait $SRV 2>/dev/null || true
 echo "=== server log ==="
 cat /tmp/srv.log
 
-if [ "$CLIENT_OK" -eq 1 ]; then
-  echo "=== SMOKE TEST PASSED ==="
-  exit 0
-else
+if [ "$CLIENT_OK" -ne 1 ]; then
   echo "=== SMOKE TEST FAILED (client exited nonzero) ==="
   exit 1
 fi
+
+# Verify the H.264 dump.
+DUMP=/tmp/openrd-display.h264
+if [ -f "$DUMP" ]; then
+  SIZE=$(stat -c%s "$DUMP")
+  echo "Display dump: $DUMP ($SIZE bytes)"
+  if [ "$SIZE" -lt 1024 ]; then
+    echo "FAIL: Display dump suspiciously small (<1 KiB)"
+    exit 1
+  fi
+  # First 5 bytes should be 0x00 0x00 0x00 0x01 + a NAL header byte
+  HEAD=$(head -c 4 "$DUMP" | od -An -tx1 | tr -d ' \n')
+  if [ "$HEAD" != "00000001" ]; then
+    echo "FAIL: Display dump doesn't start with Annex-B start code (got $HEAD)"
+    exit 1
+  fi
+  echo "Display dump starts with Annex-B start code: OK"
+else
+  echo "FAIL: Display dump $DUMP not found"
+  exit 1
+fi
+
+echo "=== SMOKE TEST PASSED ==="
+exit 0

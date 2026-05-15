@@ -529,18 +529,28 @@ async fn open_channel_and_exercise_file(
 // ===== Display receiver ===============================================
 
 async fn receive_display(mut recv: RecvStream) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let dump_path = std::env::var("OPENRD_DISPLAY_DUMP")
+        .unwrap_or_else(|_| "/tmp/openrd-display.h264".to_string());
+    let mut dump = tokio::fs::File::create(&dump_path)
+        .await
+        .with_context(|| format!("create dump file {dump_path}"))?;
+    println!("dumping received H.264 NAL stream to {dump_path}");
+
     let mut params_count = 0u32;
     let mut header_count = 0u32;
     let mut slice_count = 0u32;
     let mut end_count = 0u32;
-    let mut total_bytes = 0u64;
+    let mut total_wire_bytes = 0u64;
+    let mut total_nal_bytes = 0u64;
 
     loop {
         let frame_bytes = match read_frame_opt(&mut recv).await? {
             Some(b) => b,
             None => break,
         };
-        total_bytes += frame_bytes.len() as u64;
+        total_wire_bytes += frame_bytes.len() as u64;
         let (frame, _) = Frame::parse(&frame_bytes)?;
         let kind = DisplayFrameType::from_u8(frame.header.frame_type)?;
         match kind {
@@ -549,20 +559,38 @@ async fn receive_display(mut recv: RecvStream) -> Result<()> {
                     let codec = frame.payload[0];
                     let width = u16::from_le_bytes([frame.payload[1], frame.payload[2]]);
                     let height = u16::from_le_bytes([frame.payload[3], frame.payload[4]]);
-                    println!(
-                        "Display::StreamParameters codec=0x{codec:02x} {width}x{height}"
-                    );
+                    println!("Display::StreamParameters codec=0x{codec:02x} {width}x{height}");
                 }
                 params_count += 1;
             }
             DisplayFrameType::FrameHeader => header_count += 1,
-            DisplayFrameType::FrameSlice => slice_count += 1,
+            DisplayFrameType::FrameSlice => {
+                // FrameSlice payload layout: frame_id u32 (4) + slice_idx u8 (1)
+                // + total_slices u8 (1) + nal_length u32 (4) + nal bytes.
+                if frame.payload.len() >= 10 {
+                    let nal_len = u32::from_le_bytes([
+                        frame.payload[6],
+                        frame.payload[7],
+                        frame.payload[8],
+                        frame.payload[9],
+                    ]) as usize;
+                    let nal = &frame.payload[10..10 + nal_len.min(frame.payload.len() - 10)];
+                    // Write Annex-B: 0x00 0x00 0x00 0x01 then the NAL bytes.
+                    dump.write_all(&[0, 0, 0, 1]).await?;
+                    dump.write_all(nal).await?;
+                    total_nal_bytes += nal.len() as u64;
+                }
+                slice_count += 1;
+            }
             DisplayFrameType::FrameEnd => end_count += 1,
         }
     }
 
+    dump.flush().await?;
+    drop(dump);
+
     println!(
-        "Display summary: params={params_count} frames={header_count} slices={slice_count} ends={end_count} bytes={total_bytes}"
+        "Display summary: params={params_count} frames={header_count} slices={slice_count} ends={end_count} wire_bytes={total_wire_bytes} nal_bytes={total_nal_bytes}"
     );
     Ok(())
 }

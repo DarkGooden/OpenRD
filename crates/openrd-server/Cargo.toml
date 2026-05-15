@@ -22,4 +22,5 @@ tracing-subscriber = { workspace = true }
 ciborium = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+openh264 = { workspace = true }
 hex = "0.4"

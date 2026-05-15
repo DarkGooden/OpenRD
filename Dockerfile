@@ -14,6 +14,10 @@ RUN apt-get update \
       pkg-config \
       ca-certificates \
       curl \
+      cmake \
+      nasm \
+      clang \
+      libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # rustfmt + clippy for hygiene.

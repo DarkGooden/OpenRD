@@ -19,6 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ciborium::Value as Cbor;
+use openh264::encoder::{Encoder, EncoderConfig, FrameRate};
+use openh264::formats::YUVSlices;
+use openh264::OpenH264API;
 use openrd_proto::chat::ChatFrameType;
 use openrd_proto::clipboard::ClipboardFrameType;
 use openrd_proto::control::ControlFrameType;
@@ -58,15 +61,17 @@ pub async fn handle_control_stream(
     // client's accept_uni calls see Display then Cursor (not racing).
     send_open_channel_announce(&mut send, ChannelKind::DISPLAY.0 as u64, 100, 0).await?;
     let mut display_stream = conn.open_uni().await?.await?;
-    let sp = build_stream_parameters(
-        0x01,
-        1920,
-        1080,
-        &[0x67, 0x42, 0x00, 0x1e, 0x96, 0x35, 0x40],
-        &[0x68, 0xce, 0x38, 0x80],
-    );
+    // StreamParameters: codec H.264 Baseline at the display resolution.
+    // SPS/PPS are empty here; they appear inline as NAL units 7 and 8
+    // at the front of the first encoded IDR frame.
+    let sp = build_stream_parameters(0x01, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16, &[], &[]);
     write_frame(&mut display_stream, DisplayFrameType::StreamParameters as u8, &sp).await?;
-    info!(%remote, "Display uni stream opened + StreamParameters sent");
+    info!(
+        %remote,
+        width = DISPLAY_WIDTH,
+        height = DISPLAY_HEIGHT,
+        "Display uni stream opened + StreamParameters sent"
+    );
     handles.push(tokio::spawn(async move {
         if let Err(e) = send_display_frames(display_stream, remote).await {
             warn!(%remote, "Display handler error: {e:#}");
@@ -709,55 +714,145 @@ fn parse_file_manifest(v: &Cbor) -> (u64, String, String, usize, u64) {
 
 // ===== Display test pattern (server-initiated) ========================
 
-/// Emit the post-StreamParameters frame loop on the Display stream.
-/// (StreamParameters is sent synchronously in the main task so the
-/// stream is committed to the wire in the right order.)
-async fn send_display_frames(mut stream: SendStream, remote: SocketAddr) -> Result<()> {
-    const FRAME_COUNT: u32 = 5;
-    const N_SLICES: u8 = 4;
-    const SLICE_PAYLOAD_BYTES: usize = 256;
+const DISPLAY_WIDTH: usize = 640;
+const DISPLAY_HEIGHT: usize = 480;
+const DISPLAY_FPS: u32 = 30;
+const DISPLAY_FRAME_COUNT: u32 = 30; // ~1 second of video
 
-    for frame_id in 0..FRAME_COUNT {
-        let timestamp_us = (frame_id as u64) * 33_333;
+/// Encode a small animated YUV420 test pattern as real H.264 baseline
+/// and send the resulting NAL units as Display::FrameSlice frames.
+async fn send_display_frames(mut stream: SendStream, remote: SocketAddr) -> Result<()> {
+    let config = EncoderConfig::new().max_frame_rate(FrameRate::from_hz(DISPLAY_FPS as f32));
+    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+        .map_err(|e| anyhow!("init H.264 encoder: {e:?}"))?;
+
+    let pixels = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+    let mut y_buf = vec![0u8; pixels];
+    let mut u_buf = vec![0u8; pixels / 4];
+    let mut v_buf = vec![0u8; pixels / 4];
+
+    for frame_id in 0..DISPLAY_FRAME_COUNT {
+        let phase = frame_id as f32 / DISPLAY_FPS as f32;
+        fill_test_pattern(
+            &mut y_buf,
+            &mut u_buf,
+            &mut v_buf,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+            phase,
+        );
+        let slices = YUVSlices::new(
+            (&y_buf, &u_buf, &v_buf),
+            (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+            (DISPLAY_WIDTH, DISPLAY_WIDTH / 2, DISPLAY_WIDTH / 2),
+        );
+
+        // EncodedBitStream borrows from raw C pointers and is !Send;
+        // we must extract owned NAL bytes before any .await point.
+        let nals: Vec<Vec<u8>> = {
+            let bitstream = encoder
+                .encode(&slices)
+                .map_err(|e| anyhow!("encode frame {frame_id}: {e:?}"))?;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for li in 0..bitstream.num_layers() {
+                let layer = bitstream
+                    .layer(li)
+                    .ok_or_else(|| anyhow!("missing layer {li}"))?;
+                for ni in 0..layer.nal_count() {
+                    if let Some(nal) = layer.nal_unit(ni) {
+                        out.push(nal.to_vec());
+                    }
+                }
+            }
+            out
+        };
+
+        if nals.is_empty() {
+            // First few frames may not produce output for some configs.
+            continue;
+        }
+
+        let n_slices = nals.len().min(u8::MAX as usize) as u8;
+        // First frame's first slice is the IDR (preceded by SPS/PPS).
         let is_idr = frame_id == 0;
         let flags: u8 = if is_idr { 0x01 } else { 0x00 };
+        let timestamp_us = (frame_id as u64) * 1_000_000 / DISPLAY_FPS as u64;
 
         let mut header = Vec::with_capacity(15);
         header.extend(&frame_id.to_le_bytes());
         header.push(flags);
         header.extend(&timestamp_us.to_le_bytes());
-        header.push(N_SLICES);
+        header.push(n_slices);
         header.push(0);
-        write_frame_owned(&mut stream, DisplayFrameType::FrameHeader as u8, &header).await?;
+        write_frame(&mut stream, DisplayFrameType::FrameHeader as u8, &header).await?;
 
-        for slice_idx in 0..N_SLICES {
-            let nal = vec![0xFFu8 ^ slice_idx; SLICE_PAYLOAD_BYTES];
+        let mut total_bytes: usize = 0;
+        for (slice_idx, nal) in nals.iter().enumerate() {
             let mut slice = Vec::with_capacity(10 + nal.len());
             slice.extend(&frame_id.to_le_bytes());
-            slice.push(slice_idx);
-            slice.push(N_SLICES);
+            slice.push(slice_idx as u8);
+            slice.push(n_slices);
             slice.extend(&(nal.len() as u32).to_le_bytes());
-            slice.extend(&nal);
-            write_frame_owned(&mut stream, DisplayFrameType::FrameSlice as u8, &slice).await?;
+            slice.extend(nal);
+            write_frame(&mut stream, DisplayFrameType::FrameSlice as u8, &slice).await?;
+            total_bytes += nal.len();
         }
 
         let fe = frame_id.to_le_bytes().to_vec();
-        write_frame_owned(&mut stream, DisplayFrameType::FrameEnd as u8, &fe).await?;
+        write_frame(&mut stream, DisplayFrameType::FrameEnd as u8, &fe).await?;
 
         info!(
             %remote,
             frame_id,
             idr = is_idr,
-            n_slices = N_SLICES,
+            n_slices,
+            total_bytes,
             timestamp_us,
-            "sent Display frame"
+            "sent Display frame (real H.264)"
         );
-        tokio::time::sleep(Duration::from_millis(33)).await;
+
+        tokio::time::sleep(Duration::from_millis((1000 / DISPLAY_FPS) as u64)).await;
     }
 
     stream.finish().await.ok();
-    info!(%remote, frames = FRAME_COUNT, "finished Display uni stream");
+    info!(%remote, frames = DISPLAY_FRAME_COUNT, "finished Display uni stream");
     Ok(())
+}
+
+/// Animated YUV420 procedural test pattern: vertical-gradient luma
+/// plus phase-cycling chroma so the frames are visually distinct.
+fn fill_test_pattern(
+    y_plane: &mut [u8],
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    w: usize,
+    h: usize,
+    phase: f32,
+) {
+    for row in 0..h {
+        let scroll = ((phase * h as f32) as usize) % h;
+        let r = (row + scroll) % h;
+        let base = (r * 255 / h) as u8;
+        for col in 0..w {
+            let bar = if (col + (phase * w as f32) as usize) % w < w / 16 {
+                60u8
+            } else {
+                0u8
+            };
+            y_plane[row * w + col] = base.saturating_add(bar);
+        }
+    }
+
+    let uw = w / 2;
+    let uh = h / 2;
+    let u_val = (128.0 + 60.0 * phase.sin()) as i32;
+    let v_val = (128.0 + 60.0 * (phase + 1.5).sin()) as i32;
+    let u_val = u_val.clamp(0, 255) as u8;
+    let v_val = v_val.clamp(0, 255) as u8;
+    for i in 0..(uw * uh) {
+        u_plane[i] = u_val;
+        v_plane[i] = v_val;
+    }
 }
 
 // ===== Cursor test pattern (server-initiated) =========================
@@ -780,7 +875,7 @@ async fn send_cursor_moves(mut stream: SendStream, remote: SocketAddr) -> Result
     // Send a few CursorMove updates.
     let moves: [(i32, i32); 5] =
         [(100, 100), (200, 150), (300, 220), (450, 360), (640, 480)];
-    for (i, (x, y)) in moves.iter().enumerate() {
+    for (i, &(x, y)) in moves.iter().enumerate() {
         let mut buf = Vec::with_capacity(8);
         buf.extend(&x.to_le_bytes());
         buf.extend(&y.to_le_bytes());

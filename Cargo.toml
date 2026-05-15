@@ -26,6 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 rand = "0.9"
+openh264 = { version = "0.8", default-features = false, features = ["source"] }
 
 [profile.release]
 opt-level = 3
