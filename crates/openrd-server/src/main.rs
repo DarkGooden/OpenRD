@@ -1,10 +1,7 @@
 //! OpenRD reference server (Linux primary; runs on any host for dev).
 //!
-//! v0 status: scaffolding. The server stands up a QUIC endpoint with
-//! ALPN `openrd/v0`, accepts connections, accepts the Control
-//! bidirectional stream from the client, runs the hello exchange,
-//! and then closes. The full Control loop, capture, encode, and
-//! input injection are TODO.
+//! v0 status: scaffolding. Accepts WebTransport sessions at `/openrd`,
+//! runs hello + PIN auth + one Input channel exchange, then closes.
 //!
 //! Run with:
 //! ```text
@@ -13,17 +10,14 @@
 
 mod control;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use quinn::{Endpoint, ServerConfig};
+use anyhow::Result;
 use rand::Rng;
 use tracing::{info, warn};
+use wtransport::{Endpoint, Identity, ServerConfig};
 
-use openrd_proto::ALPN;
-
-const LISTEN_ADDR: &str = "[::]:4443";
+const LISTEN_PORT: u16 = 4443;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,83 +28,64 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("install rustls crypto provider");
+    // Self-signed dev cert. SANs include 'localhost' and '127.0.0.1' so
+    // WebTransport (which requires a hostname match) is happy.
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
 
-    let listen: SocketAddr = LISTEN_ADDR.parse()?;
-    let server_config = make_server_config()?;
-    let endpoint = Endpoint::server(server_config, listen)?;
+    // Print the cert hash so web clients (which need
+    // serverCertificateHashes to accept self-signed certs) can pin it.
+    let chain = identity.certificate_chain();
+    if let Some(cert) = chain.as_slice().first() {
+        let hash = cert.hash();
+        info!(cert_sha256 = %hash.fmt(wtransport::tls::Sha256DigestFmt::BytesArray), "server cert hash (for WebTransport pinning)");
+        info!(cert_sha256_dotted = %hash.fmt(wtransport::tls::Sha256DigestFmt::DottedHex), "server cert hash dotted-hex");
+    }
 
-    // Generate a 9-digit PIN for this server instance. Stable across
-    // connections during the server's lifetime.
+    let config = ServerConfig::builder()
+        .with_bind_default(LISTEN_PORT)
+        .with_identity(identity)
+        .build();
+    let server = Endpoint::server(config)?;
+
+    // 9-digit PIN, stable for the server's lifetime.
     let pin: String = format!("{:09}", rand::rng().random_range(0..1_000_000_000u32));
     let pin = Arc::new(pin);
     info!(pin = %pin, "OpenRD PIN issued for this server instance");
+    info!("openrd-server listening on UDP/{LISTEN_PORT} (WebTransport /openrd)");
 
-    info!("openrd-server listening on {listen} (ALPN openrd/v0)");
-
-    while let Some(incoming) = endpoint.accept().await {
+    loop {
+        let incoming = server.accept().await;
         let pin = Arc::clone(&pin);
         tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => {
-                    if let Err(e) = handle_connection(conn, pin).await {
-                        warn!("connection error: {e:#}");
-                    }
-                }
-                Err(e) => warn!("connection setup failed: {e}"),
+            if let Err(e) = serve_session(incoming, pin).await {
+                warn!("session error: {e:#}");
             }
         });
     }
-
-    Ok(())
 }
 
-async fn handle_connection(conn: quinn::Connection, pin: Arc<String>) -> Result<()> {
+async fn serve_session(
+    incoming: wtransport::endpoint::IncomingSession,
+    pin: Arc<String>,
+) -> Result<()> {
+    let session_req = incoming.await?;
+    let path = session_req.path().to_string();
+    let conn = session_req.accept().await?;
     let remote = conn.remote_address();
-    info!(%remote, "new connection");
+    info!(%remote, path = %path, "new WebTransport session");
 
-    // Accept the Control bidirectional stream from the client.
-    let (send, recv) = conn
-        .accept_bi()
-        .await
-        .context("accept Control bidi stream")?;
+    // v0 expects "/openrd"; tolerate variations during scaffolding.
+    if !path.starts_with("/openrd") {
+        warn!(%remote, path = %path, "unexpected path (expected /openrd)");
+    }
+
+    let (send, recv) = conn.accept_bi().await?;
     info!(%remote, "accepted Control bidi stream");
 
     if let Err(e) = control::handle_control_stream(&conn, send, recv, remote, &pin).await {
         warn!(%remote, "Control flow failed: {e:#}");
     }
 
-    conn.closed().await;
-    info!(%remote, "connection closed");
+    info!(%remote, "session ending");
     Ok(())
-}
-
-fn make_server_config() -> Result<ServerConfig> {
-    // Dev-only self-signed certificate. Production deployments use a
-    // real cert from the operator's PKI (file path, ACME, etc.).
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let cert_der = cert.cert.der().clone();
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(
-        cert.key_pair.serialize_der(),
-    );
-
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert_der],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
-        )?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?;
-    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_uni_streams(64u32.into());
-    transport.max_concurrent_bidi_streams(64u32.into());
-    server_config.transport_config(Arc::new(transport));
-
-    Ok(server_config)
 }

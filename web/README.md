@@ -20,32 +20,56 @@ WebTransport (recent Chromium-based; Firefox shipping).
 
 ## What works today
 
-- Opens a WebTransport session to the server URL in the input box.
-- Opens the Control bidirectional stream.
-- Sends a `ClientHello` frame with the protocol version, a client
-  name, and an empty capabilities map.
-- Logs incoming bytes from the server.
+- Opens a WebTransport session to `https://localhost:4443/openrd`,
+  pinning the server's self-signed cert via `serverCertificateHashes`.
+- Runs the full v0 scaffolding flow:
+  1. `ClientHello` (with capabilities)
+  2. `ServerHello` (parsed, fields printed)
+  3. `AuthRequest` (method=pin, credential=the PIN you paste)
+  4. `AuthResult` (status / permission / identity printed)
+  5. `OpenChannel(Input, channel_id=1)`
+  6. `OpenChannelAck`
+  7. Unidirectional Input stream with: `'a'` down, `'a'` up, and a
+     `TextInput` of `"olá, mundo 🌍 (web)"`
+
+## How to run
+
+1. Start the server (inside the Docker container):
+
+   ```sh
+   docker compose run --rm --service-ports dev cargo run -p openrd-server
+   ```
+
+   The server logs two things you need:
+
+   ```
+   ... cert_sha256_dotted=8a:be:a4:b7:...
+   ... pin=283262283
+   ```
+
+2. Serve the web client (host-side, any static file server is fine):
+
+   ```sh
+   python -m http.server -d web 8080
+   ```
+
+3. Open `http://localhost:8080/` in a recent Chromium-based browser
+   (WebTransport is shipped in Chrome / Edge / Brave; Firefox is
+   rolling out). Paste the dotted-hex cert hash and the PIN, then
+   click **Connect & run flow**.
 
 ## What does NOT work yet
 
-- The server doesn't parse the ClientHello yet — that's TODO in
-  `crates/openrd-server/src/main.rs`.
-- No `ServerHello` parsing on the client side.
-- No video decode (Display channel not wired).
-- No input forwarding (Input channel not wired).
-- No auth, no resumption, no clipboard, no files, no chat.
+- Video decode (Display channel not wired — see M5).
+- Live keyboard/mouse forwarding from the browser (only the canned
+  test events are sent).
+- No clipboard / files / chat / audio.
+- Resumption isn't implemented.
 
-## Self-signed certificate caveat
+## Self-signed cert: why the hash, not the cert
 
-The reference server uses a self-signed cert for `localhost` in dev
-mode. To make WebTransport accept it without a CA, you have to start
-Chromium with:
-
-```sh
-google-chrome \
-  --origin-to-force-quic-on=localhost:4443 \
-  --ignore-certificate-errors-spki-list=<spki-hash-here>
-```
-
-(The SPKI hash is logged by the server at startup once that's
-implemented.) Or use a proper CA-signed cert.
+WebTransport's `serverCertificateHashes` option lets a browser
+trust a specific self-signed cert without having to import a CA.
+The browser hashes the cert it receives and checks the SHA-256
+matches one in the list. The server prints the hash on startup so
+you can paste it in.

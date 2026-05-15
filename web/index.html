@@ -4,59 +4,87 @@
 <meta charset="utf-8" />
 <title>OpenRD Web Client — v0 scaffolding</title>
 <style>
+  :root { color-scheme: dark; }
   body {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     background: #111;
     color: #ddd;
-    padding: 1.5rem;
+    padding: 1.25rem 1.5rem;
     margin: 0;
+    max-width: 60rem;
   }
-  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
-  p  { color: #888; font-size: 0.9rem; line-height: 1.5; }
-  #log {
-    white-space: pre-wrap;
-    background: #000;
-    padding: 0.75rem;
+  h1 { font-size: 1.15rem; margin: 0 0 0.25rem; }
+  p.muted  { color: #888; font-size: 0.85rem; line-height: 1.45; margin: 0.25rem 0 1rem; }
+  fieldset {
     border: 1px solid #222;
-    height: 55vh;
-    overflow: auto;
-    font-size: 0.85rem;
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    margin: 0 0 1rem;
   }
-  .row { display: flex; gap: 0.5rem; align-items: center; margin: 0.75rem 0; }
-  button {
-    padding: 0.4rem 0.9rem;
-    background: #1d3a5f;
-    color: #ddd;
-    border: 1px solid #2a5180;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  button:hover { background: #244a78; }
+  legend { color: #7aa; padding: 0 0.5rem; font-size: 0.85rem; }
+  label { display: block; font-size: 0.8rem; color: #aaa; margin: 0.5rem 0 0.2rem; }
   input {
+    width: 100%;
+    box-sizing: border-box;
     padding: 0.4rem 0.6rem;
     background: #000;
     color: #ddd;
     border: 1px solid #333;
     border-radius: 3px;
     font-family: inherit;
-    flex: 1;
+    font-size: 0.85rem;
+  }
+  button {
+    padding: 0.5rem 1rem;
+    background: #1d3a5f;
+    color: #ddd;
+    border: 1px solid #2a5180;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+  button:hover { background: #244a78; }
+  #log {
+    white-space: pre-wrap;
+    background: #000;
+    padding: 0.75rem;
+    border: 1px solid #222;
+    border-radius: 3px;
+    height: 45vh;
+    overflow: auto;
+    font-size: 0.8rem;
+    line-height: 1.45;
   }
 </style>
 </head>
 <body>
 <h1>OpenRD Web Client &mdash; v0 scaffolding</h1>
-<p>
-  Connects via WebTransport, opens the Control bidirectional stream,
-  sends a stub <code>ClientHello</code> frame, and logs what the server
-  sends back. No video, no input forwarding, no auth yet &mdash; this just
-  exercises the transport path end-to-end.
+<p class="muted">
+  Connects to the OpenRD reference server over WebTransport, runs hello
+  &rarr; PIN auth &rarr; OpenChannel(Input), then sends a few key and
+  text events. Server logs them. The server prints its cert hash and
+  PIN at startup; paste them below.
 </p>
-<div class="row">
+
+<fieldset>
+  <legend>Connection</legend>
+  <label for="url">Server URL</label>
   <input id="url" value="https://localhost:4443/openrd" />
-  <button id="go">Connect</button>
-</div>
+
+  <label for="hash">Server cert SHA-256 (dotted hex, copy from server log)</label>
+  <input id="hash" placeholder="8a:be:a4:b7:..." />
+
+  <label for="pin">PIN (9 digits, copy from server log)</label>
+  <input id="pin" inputmode="numeric" placeholder="123456789" />
+
+  <p style="margin-top: 0.75rem">
+    <button id="go">Connect &amp; run flow</button>
+  </p>
+</fieldset>
+
 <div id="log"></div>
+
 <script src="./client.js" type="module"></script>
 </body>
 </html>

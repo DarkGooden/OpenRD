@@ -15,9 +15,7 @@ path = "src/main.rs"
 [dependencies]
 openrd-proto = { path = "../openrd-proto" }
 anyhow = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
-rcgen = { workspace = true }
+wtransport = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
